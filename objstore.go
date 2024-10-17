@@ -30,6 +30,7 @@ type Object struct {
 	LastModified time.Time
 	ETag         string
 	Size         int64
+	IsDirectory  bool
 }
 
 type ObjectMetadata struct {
@@ -188,7 +189,14 @@ func (s *S3Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *S3Server) handleBucket(w http.ResponseWriter, r *http.Request) {
+	var objects []Object
+	var err error
 	bucketName := mux.Vars(r)["bucket"]
+
+	queryParams := r.URL.Query()
+	listType, _ := strconv.Atoi(queryParams.Get("list-type"))
+	prefix := queryParams.Get("prefix")
+	maxKeys, _ := strconv.Atoi(queryParams.Get("max-keys"))
 
 	switch r.Method {
 	case "GET":
@@ -196,8 +204,12 @@ func (s *S3Server) handleBucket(w http.ResponseWriter, r *http.Request) {
 			s.sendErrorResponse(w, "NoSuchBucket", http.StatusNotFound)
 			return
 		}
+		if listType == 2 {
+			objects, err = s.storage.ListObjectsV2(bucketName, prefix, maxKeys)
+		} else {
+			objects, err = s.storage.ListObjects(bucketName)
+		}
 
-		objects, err := s.storage.ListObjects(bucketName)
 		if err != nil {
 			log.Printf("Error listing objects: %v", err)
 			s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
@@ -473,7 +485,7 @@ type StorageBackend interface {
 	PutObjectPart(bucket, key, uploadID string, partNumber int, data []byte) error
 	CompleteMultipartUpload(bucket, key, uploadID string, parts []CompletedPart) error
 	IsPrefix(bucket, prefix string) (bool, error)
-	ListObjectsV2(bucket, prefix string, maxKeys int64) ([]Object, error)
+	ListObjectsV2(bucket, prefix string, maxKeys int) ([]Object, error)
 }
 
 func (fs *FileSystemBackend) IsPrefix(bucket, prefix string) (bool, error) {
@@ -931,20 +943,29 @@ func (s *S3Server) handleHeadObject(w http.ResponseWriter, r *http.Request, buck
 		bucketName, objectKey, metadata.Size, metadata.IsDirectory)
 }
 
-func (fs *FileSystemBackend) ListObjectsV2(bucket, prefix string, maxKeys int64) ([]Object, error) {
+func isHidden(path string) bool {
+	name := filepath.Base(path)
+
+	if strings.HasPrefix(name, ".") {
+		return true
+	}
+
+	return false
+}
+
+func (fs *FileSystemBackend) ListObjectsV2(bucket, prefix string, maxKeys int) ([]Object, error) {
 	bucketPath := filepath.Join(fs.dataDir, bucket)
+	prefixPath := filepath.Join(bucketPath, prefix)
 
 	var objects []Object
-	err := filepath.Walk(bucketPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
+	var count int
 
-		if isHidden(path) {
-			if info.IsDir() {
-				return filepath.SkipDir
+	err := filepath.Walk(prefixPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
 			}
-			return nil
+			return err
 		}
 
 		relPath, err := filepath.Rel(bucketPath, path)
@@ -952,31 +973,33 @@ func (fs *FileSystemBackend) ListObjectsV2(bucket, prefix string, maxKeys int64)
 			return err
 		}
 
+		relPath = filepath.ToSlash(relPath)
+
 		if strings.HasPrefix(relPath, prefix) {
-			if !info.IsDir() {
-				content, err := ioutil.ReadFile(path)
-				if err != nil {
-					return err
+			if info.IsDir() {
+				if relPath != prefix && relPath != "." {
+					objects = append(objects, Object{
+						Key:          relPath + "/",
+						LastModified: info.ModTime(),
+						ETag:         "",
+						Size:         0,
+						IsDirectory:  true,
+					})
+					count++
 				}
-				hash := md5.Sum(content)
+			} else {
 				objects = append(objects, Object{
 					Key:          relPath,
 					LastModified: info.ModTime(),
-					ETag:         fmt.Sprintf("\"%x\"", hash),
+					ETag:         fmt.Sprintf("\"%x\"", md5.Sum([]byte(relPath))), // Simple ETag for demo
 					Size:         info.Size(),
+					IsDirectory:  false,
 				})
-			} else if relPath != "." {
-				// Add a directory marker
-				objects = append(objects, Object{
-					Key:          relPath + "/",
-					LastModified: info.ModTime(),
-					ETag:         "",
-					Size:         0,
-				})
+				count++
 			}
 		}
 
-		if int64(len(objects)) >= maxKeys {
+		if count >= maxKeys {
 			return filepath.SkipDir
 		}
 
@@ -987,15 +1010,36 @@ func (fs *FileSystemBackend) ListObjectsV2(bucket, prefix string, maxKeys int64)
 		return nil, err
 	}
 
-	return objects, nil
-}
-
-func isHidden(path string) bool {
-	name := filepath.Base(path)
-
-	if strings.HasPrefix(name, ".") {
-		return true
+	if len(objects) == 0 {
+		files, err := os.ReadDir(bucketPath)
+		if err != nil {
+			return nil, err
+		}
+		for _, file := range files {
+			if strings.HasPrefix(file.Name(), prefix) {
+				relPath := filepath.ToSlash(file.Name())
+				info, err := file.Info()
+				if err != nil {
+					continue
+				}
+				objects = append(objects, Object{
+					Key:          relPath,
+					LastModified: info.ModTime(),
+					ETag:         fmt.Sprintf("\"%x\"", md5.Sum([]byte(relPath))), // Simple ETag for demo
+					Size:         info.Size(),
+					IsDirectory:  file.IsDir(),
+				})
+				count++
+				if count >= maxKeys {
+					break
+				}
+			}
+		}
 	}
 
-	return false
+	fmt.Printf("ListObjectsV2: Found %d objects\n", len(objects))
+	for _, obj := range objects {
+		fmt.Printf("  - Key: %s, IsDirectory: %v\n", obj.Key, obj.IsDirectory)
+	}
+	return objects, nil
 }
