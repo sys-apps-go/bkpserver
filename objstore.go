@@ -245,6 +245,9 @@ func (s *S3Server) handleBucket(w http.ResponseWriter, r *http.Request) {
 				Size         int64  `xml:"Size"`
 				StorageClass string `xml:"StorageClass"`
 			} `xml:"Contents"`
+			CommonPrefixes []struct {
+				Prefix string `xml:"Prefix"`
+			}
 			EncodingType string `xml:"EncodingType"`
 		}{
 			Xmlns:        "http://s3.amazonaws.com/doc/2006-03-01/",
@@ -255,24 +258,36 @@ func (s *S3Server) handleBucket(w http.ResponseWriter, r *http.Request) {
 			IsTruncated:  false,
 			EncodingType: "url",
 		}
+
 		for _, obj := range objects {
-			response.Contents = append(response.Contents, struct {
-				Key          string `xml:"Key"`
-				LastModified string `xml:"LastModified"`
-				ETag         string `xml:"ETag"`
-				Size         int64  `xml:"Size"`
-				StorageClass string `xml:"StorageClass"`
-			}{
-				Key:          obj.Key,
-				LastModified: formatMinioTime(obj.LastModified),
-				ETag:         obj.ETag,
-				Size:         obj.Size,
-				StorageClass: "STANDARD",
-			})
+			if !obj.IsDirectory {
+				response.Contents = append(response.Contents, struct {
+					Key          string `xml:"Key"`
+					LastModified string `xml:"LastModified"`
+					ETag         string `xml:"ETag"`
+					Size         int64  `xml:"Size"`
+					StorageClass string `xml:"StorageClass"`
+				}{
+					Key:          obj.Key,
+					LastModified: formatMinioTime(obj.LastModified),
+					ETag:         obj.ETag,
+					Size:         obj.Size,
+					StorageClass: "STANDARD",
+				})
+			} else {
+				response.CommonPrefixes = append(response.CommonPrefixes, struct {
+					Prefix string `xml:"Prefix"`
+				}{
+					Prefix: obj.Key,
+				})
+			}
 		}
 		response.KeyCount = len(response.Contents)
 
 		for i := range response.Contents {
+			if strings.HasSuffix(response.Contents[i].Key, "/") {
+				response.Contents[i].StorageClass = ""
+			}
 			// Remove trailing slash from Key if present
 			response.Contents[i].Key = strings.TrimSuffix(response.Contents[i].Key, "/")
 		}
@@ -1175,6 +1190,7 @@ func (fs *FileSystemBackend) ListObjectsV2(bucket, prefix string, maxKeys int) (
 
 	for _, entry := range entries {
 		relPath := entry.Name()
+		relPathSave := entry.Name()
 		if prefix != "" {
 			relPath = strings.TrimPrefix(relPath, prefix)
 			relPath = strings.TrimPrefix(relPath, "/")
@@ -1185,6 +1201,8 @@ func (fs *FileSystemBackend) ListObjectsV2(bucket, prefix string, maxKeys int) (
 				continue
 			}
 		}
+		relPath = filepath.Join(prefix, relPathSave)
+
 		object := Object{
 			Key:          relPath,
 			LastModified: entry.ModTime(),
