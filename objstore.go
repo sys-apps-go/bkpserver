@@ -1105,20 +1105,29 @@ func (fs *FileSystemBackend) ListBucket(bucket string) ([]Object, error) {
 		if isHidden(entry.Name()) {
 			continue
 		}
+
+		// Check for .metadata file
+		metadataPath := filepath.Join(bucketPath, "."+entry.Name()+".metadata")
+		if _, err := os.Stat(metadataPath); os.IsNotExist(err) {
+			// Skip if .metadata file doesn't exist
+			continue
+		}
+
 		relPath := filepath.ToSlash(entry.Name())
-		key := relPath + "/"
+		key := relPath
+		if entry.IsDir() {
+			key += "/"
+		}
+
 		objects = append(objects, Object{
 			Key:          key,
 			LastModified: entry.ModTime(),
 			ETag:         fmt.Sprintf("\"%x\"", md5.Sum([]byte(key))),
 			Size:         entry.Size(),
-			IsDirectory:  true,
+			IsDirectory:  entry.IsDir(),
 		})
 	}
 
-	for _, obj := range objects {
-		fmt.Println(obj)
-	}
 	return objects, nil
 }
 
