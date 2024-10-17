@@ -204,6 +204,10 @@ func (s *S3Server) handleBucket(w http.ResponseWriter, r *http.Request) {
 	prefix := queryParams.Get("prefix")
 	maxKeys, _ := strconv.Atoi(queryParams.Get("max-keys"))
 
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+
 	switch r.Method {
 	case "GET":
 		if !s.storage.BucketExists(bucketName) {
@@ -291,15 +295,19 @@ func (s *S3Server) handleBucket(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Xss-Protection", "1; mode=block")
 		w.Header().Set("Date", time.Now().UTC().Format(http.TimeFormat))
 
-		// Encode and send response without indentation
-		xmlData, err := xml.Marshal(response)
-		if err != nil {
+		// Create XML encoder with indentation
+		encoder := xml.NewEncoder(w)
+		encoder.Indent("", "  ")
+
+		// Write XML declaration
+		w.Write([]byte(xml.Header))
+
+		// Encode and write the response
+		if err := encoder.Encode(response); err != nil {
 			log.Printf("Error encoding response: %v", err)
-			s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
+			http.Error(w, "Error encoding response", http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("Content-Length", strconv.Itoa(len(xmlData)))
-		w.Write(xmlData)
 
 	case "PUT":
 		if !isValidBucketName(bucketName) {
@@ -1044,6 +1052,10 @@ func isHidden(path string) bool {
 }
 
 func (fs *FileSystemBackend) ListObjectsV2Recursive(bucket, prefix string, maxKeys int) ([]Object, error) {
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+
 	bucketPath := filepath.Join(fs.dataDir, bucket)
 	prefixPath := filepath.Join(bucketPath, prefix)
 
@@ -1142,6 +1154,10 @@ func (fs *FileSystemBackend) ListObjectsV2Recursive(bucket, prefix string, maxKe
 }
 
 func (fs *FileSystemBackend) ListObjectsV2(bucket, prefix string, maxKeys int) ([]Object, error) {
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+
 	bucketPath := filepath.Join(fs.dataDir, bucket)
 	prefixPath := filepath.Join(bucketPath, prefix)
 
@@ -1280,4 +1296,3 @@ func generateUniqueID() string {
 func formatMinioTime(t time.Time) string {
 	return t.Format("2006-01-02 15:04:05")
 }
-
