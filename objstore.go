@@ -502,7 +502,7 @@ func main() {
 
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("Received request: %s %s", r.Method, r.URL)
+		//log.Printf("Received request: %s %s", r.Method, r.URL)
 		next.ServeHTTP(w, r)
 	})
 }
@@ -657,6 +657,63 @@ func (fs *FileSystemBackend) GetObjectMetadata(bucket, key string) (*ObjectMetad
 }
 
 func (fs *FileSystemBackend) PutObject(bucket, key string, data []byte, metadata map[string]string) error {
+    fullPath := filepath.Join(fs.dataDir, bucket, key)
+
+    // Ensure all parent directories exist
+    dir := filepath.Dir(fullPath)
+    if err := os.MkdirAll(dir, 0755); err != nil {
+        return fmt.Errorf("failed to create directory: %v", err)
+    }
+
+    // If the key ends with a slash, it's a directory
+    if strings.HasSuffix(key, "/") {
+        // Remove trailing slash
+        key = strings.TrimSuffix(key, "/")
+
+        // Create the directory
+        if err := os.MkdirAll(fullPath, 0755); err != nil {
+            return fmt.Errorf("failed to create directory: %v", err)
+        }
+
+        // Create the control file .<dir name>.metadata
+        controlFileName := "." + filepath.Base(key) + ".metadata"
+        controlFilePath := filepath.Join(dir, controlFileName)
+
+        // Marshal metadata to JSON
+        metadataJSON, err := json.Marshal(metadata)
+        if err != nil {
+            return fmt.Errorf("failed to marshal metadata: %v", err)
+        }
+
+        // Write the control file
+        if err := ioutil.WriteFile(controlFilePath, metadataJSON, 0644); err != nil {
+            return fmt.Errorf("failed to write control file: %v", err)
+        }
+
+        return nil
+    }
+
+    // Write the file
+    if err := ioutil.WriteFile(fullPath, data, 0644); err != nil {
+        return fmt.Errorf("failed to write file: %v", err)
+    }
+
+    // Store metadata for regular files
+    metadataPath := fullPath + ".metadata"
+    metadataPath = filepath.Join(filepath.Dir(metadataPath), fmt.Sprintf(".%v", filepath.Base(metadataPath)))
+    metadataJSON, err := json.Marshal(metadata)
+    if err != nil {
+        return fmt.Errorf("failed to marshal metadata: %v", err)
+    }
+    if err := ioutil.WriteFile(metadataPath, metadataJSON, 0644); err != nil {
+        return fmt.Errorf("failed to write metadata: %v", err)
+    }
+
+    return nil
+}
+
+
+func (fs *FileSystemBackend) PutObject1(bucket, key string, data []byte, metadata map[string]string) error {
 	fullPath := filepath.Join(fs.dataDir, bucket, key)
 
 	// Ensure all parent directories exist
@@ -666,7 +723,6 @@ func (fs *FileSystemBackend) PutObject(bucket, key string, data []byte, metadata
 	}
 	// If the key ends with a slash, it's a directory
 	if strings.HasSuffix(key, "/") {
-		// For directories, just ensure it exists and return
 		return nil
 	}
 
@@ -742,17 +798,17 @@ func (s *S3Server) initiateMultipartUpload(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *S3Server) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Request) {
-	log.Println("handleCreateMultipartUpload function called")
+	//log.Println("handleCreateMultipartUpload function called")
 
 	vars := mux.Vars(r)
-	log.Printf("vars: %+v\n", vars)
+	//log.Printf("vars: %+v\n", vars)
 
 	bucketName := vars["bucket"]
 	objectKey := vars["key"]
-	log.Printf("bucketName: %s, objectKey: %s\n", bucketName, objectKey)
+	//log.Printf("bucketName: %s, objectKey: %s\n", bucketName, objectKey)
 
 	// Log query parameters
-	log.Printf("Query params: %v\n", r.URL.Query())
+	//log.Printf("Query params: %v\n", r.URL.Query())
 
 	// Initiate the multipart upload
 	uploadID, err := s.storage.InitiateMultipartUpload(bucketName, objectKey)
@@ -990,7 +1046,7 @@ func isHidden(path string) bool {
 	return false
 }
 
-func (fs *FileSystemBackend) ListObjectsV2(bucket, prefix string, maxKeys int) ([]Object, error) {
+func (fs *FileSystemBackend) ListObjectsV2Recursive(bucket, prefix string, maxKeys int) ([]Object, error) {
 	bucketPath := filepath.Join(fs.dataDir, bucket)
 	prefixPath := filepath.Join(bucketPath, prefix)
 
@@ -1081,10 +1137,69 @@ func (fs *FileSystemBackend) ListObjectsV2(bucket, prefix string, maxKeys int) (
 		}
 	}
 
-	fmt.Printf("ListObjectsV2: Found %d objects\n", len(objects))
-	for _, obj := range objects {
-		fmt.Printf("  - Key: %s, IsDirectory: %v\n", obj.Key, obj.IsDirectory)
+	//fmt.Printf("ListObjectsV2: Found %d objects\n", len(objects))
+	//for _, obj := range objects {
+	//	fmt.Printf("  - Key: %s, IsDirectory: %v\n", obj.Key, obj.IsDirectory)
+	//}
+	return objects, nil
+}
+
+func (fs *FileSystemBackend) ListObjectsV2(bucket, prefix string, maxKeys int) ([]Object, error) {
+	bucketPath := filepath.Join(fs.dataDir, bucket)
+	prefixPath := filepath.Join(bucketPath, prefix)
+
+	var objects []Object
+	var count int
+
+	// Read the directory contents
+	entries, err := ioutil.ReadDir(prefixPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil // Return empty list if directory doesn't exist
+		}
+		return nil, err
 	}
+
+	for _, entry := range entries {
+		//relPath := filepath.ToSlash(filepath.Join(prefix, entry.Name()))
+		relPath := entry.Name()
+		if prefix != "" {
+			relPath = strings.TrimPrefix(relPath, prefix)
+			relPath = strings.TrimPrefix(relPath, "/")
+			ctrlFile := "." + relPath + ".metadata"
+			ctrlFilePath := filepath.Join(prefixPath, ctrlFile)
+			_, err := os.Stat(ctrlFilePath)
+			if err != nil {
+				continue
+			}
+		}
+
+		object := Object{
+			Key:          relPath,
+			LastModified: entry.ModTime(),
+			ETag:         fmt.Sprintf("\"%x\"", md5.Sum([]byte(relPath))), // Simple ETag for demo
+			Size:         entry.Size(),
+			IsDirectory:  entry.IsDir(),
+		}
+
+		if entry.IsDir() {
+			object.Key = object.Key + "/"
+			object.Size = 0
+		}
+
+		objects = append(objects, object)
+		count++
+
+		if maxKeys != 0 && count >= maxKeys {
+			break
+		}
+	}
+
+	// If no objects found in the prefix directory, list the bucket root
+	if len(objects) == 0 && prefix != "" {
+		return fs.ListObjectsV2(bucket, "", maxKeys)
+	}
+
 	return objects, nil
 }
 
@@ -1134,7 +1249,6 @@ func (fs *FileSystemBackend) ListBucket(bucket string) ([]Object, error) {
 func authMiddleware(accessKeyID, secretAccessKey string) mux.MiddlewareFunc {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			log.Println("authMiddleware")
 
 			// Check for Authorization header
 			authHeader := r.Header.Get("Authorization")
