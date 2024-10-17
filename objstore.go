@@ -657,63 +657,6 @@ func (fs *FileSystemBackend) GetObjectMetadata(bucket, key string) (*ObjectMetad
 }
 
 func (fs *FileSystemBackend) PutObject(bucket, key string, data []byte, metadata map[string]string) error {
-    fullPath := filepath.Join(fs.dataDir, bucket, key)
-
-    // Ensure all parent directories exist
-    dir := filepath.Dir(fullPath)
-    if err := os.MkdirAll(dir, 0755); err != nil {
-        return fmt.Errorf("failed to create directory: %v", err)
-    }
-
-    // If the key ends with a slash, it's a directory
-    if strings.HasSuffix(key, "/") {
-        // Remove trailing slash
-        key = strings.TrimSuffix(key, "/")
-
-        // Create the directory
-        if err := os.MkdirAll(fullPath, 0755); err != nil {
-            return fmt.Errorf("failed to create directory: %v", err)
-        }
-
-        // Create the control file .<dir name>.metadata
-        controlFileName := "." + filepath.Base(key) + ".metadata"
-        controlFilePath := filepath.Join(dir, controlFileName)
-
-        // Marshal metadata to JSON
-        metadataJSON, err := json.Marshal(metadata)
-        if err != nil {
-            return fmt.Errorf("failed to marshal metadata: %v", err)
-        }
-
-        // Write the control file
-        if err := ioutil.WriteFile(controlFilePath, metadataJSON, 0644); err != nil {
-            return fmt.Errorf("failed to write control file: %v", err)
-        }
-
-        return nil
-    }
-
-    // Write the file
-    if err := ioutil.WriteFile(fullPath, data, 0644); err != nil {
-        return fmt.Errorf("failed to write file: %v", err)
-    }
-
-    // Store metadata for regular files
-    metadataPath := fullPath + ".metadata"
-    metadataPath = filepath.Join(filepath.Dir(metadataPath), fmt.Sprintf(".%v", filepath.Base(metadataPath)))
-    metadataJSON, err := json.Marshal(metadata)
-    if err != nil {
-        return fmt.Errorf("failed to marshal metadata: %v", err)
-    }
-    if err := ioutil.WriteFile(metadataPath, metadataJSON, 0644); err != nil {
-        return fmt.Errorf("failed to write metadata: %v", err)
-    }
-
-    return nil
-}
-
-
-func (fs *FileSystemBackend) PutObject1(bucket, key string, data []byte, metadata map[string]string) error {
 	fullPath := filepath.Join(fs.dataDir, bucket, key)
 
 	// Ensure all parent directories exist
@@ -721,8 +664,32 @@ func (fs *FileSystemBackend) PutObject1(bucket, key string, data []byte, metadat
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("failed to create directory: %v", err)
 	}
+
 	// If the key ends with a slash, it's a directory
 	if strings.HasSuffix(key, "/") {
+		// Remove trailing slash
+		key = strings.TrimSuffix(key, "/")
+
+		// Create the directory
+		if err := os.MkdirAll(fullPath, 0755); err != nil {
+			return fmt.Errorf("failed to create directory: %v", err)
+		}
+
+		// Create the control file .<dir name>.metadata
+		controlFileName := "." + filepath.Base(key) + ".metadata"
+		controlFilePath := filepath.Join(dir, controlFileName)
+
+		// Marshal metadata to JSON
+		metadataJSON, err := json.Marshal(metadata)
+		if err != nil {
+			return fmt.Errorf("failed to marshal metadata: %v", err)
+		}
+
+		// Write the control file
+		if err := ioutil.WriteFile(controlFilePath, metadataJSON, 0644); err != nil {
+			return fmt.Errorf("failed to write control file: %v", err)
+		}
+
 		return nil
 	}
 
@@ -731,7 +698,7 @@ func (fs *FileSystemBackend) PutObject1(bucket, key string, data []byte, metadat
 		return fmt.Errorf("failed to write file: %v", err)
 	}
 
-	// Store metadata (you might want to implement a separate metadata storage system)
+	// Store metadata for regular files
 	metadataPath := fullPath + ".metadata"
 	metadataPath = filepath.Join(filepath.Dir(metadataPath), fmt.Sprintf(".%v", filepath.Base(metadataPath)))
 	metadataJSON, err := json.Marshal(metadata)
@@ -972,6 +939,25 @@ func (fs *FileSystemBackend) CompleteMultipartUpload(bucket, key, uploadID strin
 		if err != nil {
 			return fmt.Errorf("failed to write to final file: %v", err)
 		}
+	}
+
+	// Create control file
+	controlFileName := "." + filepath.Base(key) + ".metadata"
+	controlFilePath := filepath.Join(filepath.Dir(finalPath), controlFileName)
+
+	metadata := map[string]string{
+		"UploadID": uploadID,
+		"Parts":    fmt.Sprintf("%d", len(parts)),
+		// Add any other metadata you want to store
+	}
+
+	metadataJSON, err := json.Marshal(metadata)
+	if err != nil {
+		return fmt.Errorf("failed to marshal metadata: %v", err)
+	}
+
+	if err := ioutil.WriteFile(controlFilePath, metadataJSON, 0644); err != nil {
+		return fmt.Errorf("failed to write control file: %v", err)
 	}
 
 	// Clean up the upload directory
