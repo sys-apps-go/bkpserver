@@ -260,7 +260,7 @@ func (s *S3Server) handleBucket(w http.ResponseWriter, r *http.Request) {
 				StorageClass string `xml:"StorageClass"`
 			}{
 				Key:          obj.Key,
-				LastModified: obj.LastModified.Format(time.RFC3339),
+				LastModified: formatMinioTime(obj.LastModified),
 				ETag:         obj.ETag,
 				Size:         obj.Size,
 				StorageClass: "STANDARD",
@@ -269,7 +269,6 @@ func (s *S3Server) handleBucket(w http.ResponseWriter, r *http.Request) {
 		response.KeyCount = len(response.Contents)
 
 		for i := range response.Contents {
-			response.Contents[i].LastModified = response.Contents[i].LastModified[:19] + "Z"
 			// Remove trailing slash from Key if present
 			response.Contents[i].Key = strings.TrimSuffix(response.Contents[i].Key, "/")
 		}
@@ -1160,7 +1159,6 @@ func (fs *FileSystemBackend) ListObjectsV2(bucket, prefix string, maxKeys int) (
 	}
 
 	for _, entry := range entries {
-		//relPath := filepath.ToSlash(filepath.Join(prefix, entry.Name()))
 		relPath := entry.Name()
 		if prefix != "" {
 			relPath = strings.TrimPrefix(relPath, prefix)
@@ -1172,7 +1170,6 @@ func (fs *FileSystemBackend) ListObjectsV2(bucket, prefix string, maxKeys int) (
 				continue
 			}
 		}
-
 		object := Object{
 			Key:          relPath,
 			LastModified: entry.ModTime(),
@@ -1280,3 +1277,8 @@ func generateUniqueID() string {
 	}
 	return hex.EncodeToString(b)
 }
+
+func formatMinioTime(t time.Time) string {
+	return t.Format("2006-01-02 15:04:05")
+}
+
