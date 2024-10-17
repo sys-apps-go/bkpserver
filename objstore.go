@@ -466,7 +466,7 @@ func main() {
 
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("Received request: %s %s", r.Method, r.URL)
+		//log.Printf("Received request: %s %s", r.Method, r.URL)
 		next.ServeHTTP(w, r)
 	})
 }
@@ -916,7 +916,7 @@ func calculateETag(parts []CompletedPart) string {
 }
 
 func (s *S3Server) handleHeadObject(w http.ResponseWriter, r *http.Request, bucketName, objectKey string) {
-	log.Printf("Handling HEAD request for bucket: %s, key: %s", bucketName, objectKey)
+	//log.Printf("Handling HEAD request for bucket: %s, key: %s", bucketName, objectKey)
 
 	metadata, err := s.storage.GetObjectMetadata(bucketName, objectKey)
 	if err != nil {
@@ -939,8 +939,8 @@ func (s *S3Server) handleHeadObject(w http.ResponseWriter, r *http.Request, buck
 	}
 
 	w.WriteHeader(http.StatusOK)
-	log.Printf("Successfully responded to HEAD request: bucket=%s, key=%s, size=%d, isDirectory=%v",
-		bucketName, objectKey, metadata.Size, metadata.IsDirectory)
+	//log.Printf("Successfully responded to HEAD request: bucket=%s, key=%s, size=%d, isDirectory=%v",
+	//	bucketName, objectKey, metadata.Size, metadata.IsDirectory)
 }
 
 func isHidden(path string) bool {
@@ -1037,9 +1037,9 @@ func (fs *FileSystemBackend) ListObjectsV2(bucket, prefix string, maxKeys int) (
 		}
 	}
 
-	fmt.Printf("ListObjectsV2: Found %d objects\n", len(objects))
-	for _, obj := range objects {
-		fmt.Printf("  - Key: %s, IsDirectory: %v\n", obj.Key, obj.IsDirectory)
-	}
+	//fmt.Printf("ListObjectsV2: Found %d objects\n", len(objects))
+	//for _, obj := range objects {
+		//fmt.Printf("  - Key: %s, IsDirectory: %v\n", obj.Key, obj.IsDirectory)
+	//}
 	return objects, nil
 }
