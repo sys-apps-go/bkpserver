@@ -664,7 +664,6 @@ func (fs *FileSystemBackend) PutObject(bucket, key string, data []byte, metadata
 	fullPath := filepath.Join(fs.dataDir, bucket, key)
 
 	// Ensure all parent directories exist and create control files for them
-	fmt.Println("**************", key)
 	err := fs.createDirectoriesAndControlFiles(bucket, filepath.Dir(key))
 	if err != nil {
 		return err
