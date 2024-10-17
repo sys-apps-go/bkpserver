@@ -8,3 +8,7 @@ Object Storage with following features:
 	- Bucket and Object Listing: Implementation can list buckets and objects within buckets.
 	- Middleware: Logging middleware to track incoming requests.
 
+If not already done
+sudo useradd -r objstore-user -g objstore-user
+sudo mkdir /mnt/objs-data
+sudo chown objstore-user:objstore-user /mnt/objs-data

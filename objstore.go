@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	objectStoreDataDir = "/mnt/objsdata"
+	objectStoreDataDir = "/mnt/objsdata/"
 )
 
 type Object struct {
@@ -111,7 +111,11 @@ func newFileSystemBackend(dataDir string) error {
 	return nil
 }
 
+// Create buket if not existing
 func (fs *FileSystemBackend) CreateBucket(name string) error {
+	if fs.BucketExists(name) {
+		return nil
+	}
 	return os.Mkdir(filepath.Join(fs.dataDir, name), 0755)
 }
 
@@ -362,7 +366,7 @@ func generateRequestID() string {
 
 func main() {
 	app := &cli.App{
-		Name:  "minio-config",
+		Name:  "objstore-config",
 		Usage: "Retrieve ObjStore configuration",
 		Flags: []cli.Flag{
 			&cli.StringFlag{
@@ -374,19 +378,19 @@ func main() {
 			&cli.StringFlag{
 				Name:    "access-key-id",
 				Aliases: []string{"ak"},
-				Value:   "minioadmin",
+				Value:   "objstoreadmin",
 				Usage:   "ObjStore access key ID",
 			},
 			&cli.StringFlag{
 				Name:    "secret-access-key",
 				Aliases: []string{"sk"},
-				Value:   "minioadmin",
+				Value:   "objstoreadmin",
 				Usage:   "ObjStore secret access key",
 			},
 			&cli.StringFlag{
 				Name:    "filesystem-drive",
 				Aliases: []string{"f"},
-				Value:   "/mnt/data",
+				Value:   objectStoreDataDir,
 				Usage:   "Filesystem directory for ObjStore",
 			},
 		},
@@ -502,32 +506,28 @@ func (fs *FileSystemBackend) ListObjects(bucket string) ([]Object, error) {
 		if path == bucketPath {
 			return nil
 		}
+		if isHidden(path) {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
 
-		// Get the relative path from the bucket root
-		relPath, err := filepath.Rel(bucketPath, path)
+		// Get the key (path relative to bucket root)
+		key, err := filepath.Rel(bucketPath, path)
 		if err != nil {
 			return err
 		}
+		key = filepath.ToSlash(key) // Convert to forward slashes for S3 compatibility
 
-		// Replace backslashes with forward slashes for S3 compatibility
-		relPath = filepath.ToSlash(relPath)
-
-		if info.IsDir() {
-			// Add a trailing slash to directory names
-			objects = append(objects, Object{
-				Key:          relPath + "/",
-				LastModified: info.ModTime(),
-				ETag:         "",
-				Size:         0,
-			})
-		} else {
+		if !info.IsDir() {
 			content, err := ioutil.ReadFile(path)
 			if err != nil {
 				return err
 			}
 			hash := md5.Sum(content)
 			objects = append(objects, Object{
-				Key:          relPath,
+				Key:          key,
 				LastModified: info.ModTime(),
 				ETag:         fmt.Sprintf("\"%x\"", hash),
 				Size:         info.Size(),
@@ -628,6 +628,7 @@ func (fs *FileSystemBackend) PutObject(bucket, key string, data []byte, metadata
 
 	// Store metadata (you might want to implement a separate metadata storage system)
 	metadataPath := fullPath + ".metadata"
+	metadataPath = filepath.Join(filepath.Dir(metadataPath), fmt.Sprintf(".%v", filepath.Base(metadataPath)))
 	metadataJSON, err := json.Marshal(metadata)
 	if err != nil {
 		return fmt.Errorf("failed to marshal metadata: %v", err)
@@ -939,6 +940,13 @@ func (fs *FileSystemBackend) ListObjectsV2(bucket, prefix string, maxKeys int64)
 			return err
 		}
 
+		if isHidden(path) {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
 		relPath, err := filepath.Rel(bucketPath, path)
 		if err != nil {
 			return err
@@ -980,4 +988,14 @@ func (fs *FileSystemBackend) ListObjectsV2(bucket, prefix string, maxKeys int64)
 	}
 
 	return objects, nil
+}
+
+func isHidden(path string) bool {
+	name := filepath.Base(path)
+
+	if strings.HasPrefix(name, ".") {
+		return true
+	}
+
+	return false
 }
