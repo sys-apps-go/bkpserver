@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
-	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,6 +19,7 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/urfave/cli/v2"
+
 )
 
 const (
@@ -227,7 +227,6 @@ func (s *S3Server) handleBucket(w http.ResponseWriter, r *http.Request) {
 			Prefix      string   `xml:"Prefix"`
 			KeyCount    int      `xml:"KeyCount"`
 			MaxKeys     int      `xml:"MaxKeys"`
-			Delimiter   string   `xml:"Delimiter"`
 			IsTruncated bool     `xml:"IsTruncated"`
 			Contents    []struct {
 				Key          string `xml:"Key"`
@@ -236,16 +235,14 @@ func (s *S3Server) handleBucket(w http.ResponseWriter, r *http.Request) {
 				Size         int64  `xml:"Size"`
 				StorageClass string `xml:"StorageClass"`
 			} `xml:"Contents"`
-			EncodingType string `xml:"EncodingType"`
 		}{
-			Xmlns:        "http://s3.amazonaws.com/doc/2006-03-01/",
-			Name:         bucketName,
-			Prefix:       prefix,
-			MaxKeys:      1000,
-			Delimiter:    "/",
-			IsTruncated:  false,
-			EncodingType: "url",
+			Xmlns:       "http://s3.amazonaws.com/doc/2006-03-01/",
+			Name:        bucketName,
+			Prefix:      "",
+			MaxKeys:     1000,
+			IsTruncated: false,
 		}
+
 		for _, obj := range objects {
 			response.Contents = append(response.Contents, struct {
 				Key          string `xml:"Key"`
@@ -263,39 +260,13 @@ func (s *S3Server) handleBucket(w http.ResponseWriter, r *http.Request) {
 		}
 		response.KeyCount = len(response.Contents)
 
-		for i := range response.Contents {
-			response.Contents[i].LastModified = response.Contents[i].LastModified[:19] + "Z"
-			// Remove trailing slash from Key if present
-			response.Contents[i].Key = strings.TrimSuffix(response.Contents[i].Key, "/")
-		}
-
-		// Generate unique IDs for headers
-		uniqueID := generateUniqueID()
-		requestID := generateUniqueID()
-
-		// Set headers
-		w.Header().Set("Accept-Ranges", "bytes")
 		w.Header().Set("Content-Type", "application/xml")
-		w.Header().Set("Server", "MinIO")
-		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-		w.Header().Set("Vary", "Origin, Accept-Encoding")
-		w.Header().Set("X-Amz-Id-2", uniqueID)
-		w.Header().Set("X-Amz-Request-Id", requestID)
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("X-Ratelimit-Limit", "333")
-		w.Header().Set("X-Ratelimit-Remaining", "333")
-		w.Header().Set("X-Xss-Protection", "1; mode=block")
-		w.Header().Set("Date", time.Now().UTC().Format(http.TimeFormat))
-
-		// Encode and send response without indentation
-		xmlData, err := xml.Marshal(response)
-		if err != nil {
+		enc := xml.NewEncoder(w)
+		enc.Indent("", "  ")
+		if err := enc.Encode(response); err != nil {
 			log.Printf("Error encoding response: %v", err)
 			s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
-			return
 		}
-		w.Header().Set("Content-Length", strconv.Itoa(len(xmlData)))
-		w.Write(xmlData)
 
 	case "PUT":
 		if !isValidBucketName(bucketName) {
@@ -512,7 +483,7 @@ type StorageBackend interface {
 	DeleteBucket(name string) error
 	ListBuckets() ([]Bucket, error)
 	ListObjects(bucket string) ([]Object, error)
-	ListBucket(bucket string) ([]Object, error)
+	ListBucket(bucket string) ([]Object, error) 
 	GetObject(bucket, key string) ([]byte, error)
 	DeleteObject(bucket, key string) error
 	BucketExists(name string) bool
@@ -1089,37 +1060,37 @@ func (fs *FileSystemBackend) ListObjectsV2(bucket, prefix string, maxKeys int) (
 }
 
 func (fs *FileSystemBackend) ListBucket(bucket string) ([]Object, error) {
-	bucketPath := filepath.Join(fs.dataDir, bucket)
+    bucketPath := filepath.Join(fs.dataDir, bucket)
 
-	entries, err := ioutil.ReadDir(bucketPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil // Return empty list if bucket doesn't exist
-		}
-		return nil, err
-	}
+    entries, err := ioutil.ReadDir(bucketPath)
+    if err != nil {
+        if os.IsNotExist(err) {
+            return nil, nil // Return empty list if bucket doesn't exist
+        }
+        return nil, err
+    }
 
-	var objects []Object
+    var objects []Object
 
-	for _, entry := range entries {
+    for _, entry := range entries {
 		if isHidden(entry.Name()) {
 			continue
 		}
-		relPath := filepath.ToSlash(entry.Name())
-		key := relPath + "/"
-		objects = append(objects, Object{
-			Key:          key,
-			LastModified: entry.ModTime(),
-			ETag:         fmt.Sprintf("\"%x\"", md5.Sum([]byte(key))),
-			Size:         entry.Size(),
-			IsDirectory:  true,
-		})
-	}
+            relPath := filepath.ToSlash(entry.Name())
+	    key := relPath + "/"
+            objects = append(objects, Object{
+                Key:          key,
+                LastModified: entry.ModTime(),
+                ETag:         fmt.Sprintf("\"%x\"", md5.Sum([]byte(key))),
+                Size:         entry.Size(),
+                IsDirectory:  true,
+            })
+    }
 
-	for _, obj := range objects {
-		fmt.Println(obj)
-	}
-	return objects, nil
+    for _, obj := range objects {
+        fmt.Println(obj)
+    }
+    return objects, nil
 }
 
 func authMiddleware(accessKeyID, secretAccessKey string) mux.MiddlewareFunc {
@@ -1149,12 +1120,4 @@ func authMiddleware(accessKeyID, secretAccessKey string) mux.MiddlewareFunc {
 			}
 		})
 	}
-}
-func generateUniqueID() string {
-	b := make([]byte, 16)
-	_, err := rand.Read(b)
-	if err != nil {
-		return ""
-	}
-	return hex.EncodeToString(b)
 }
