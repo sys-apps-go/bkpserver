@@ -403,7 +403,7 @@ func (s *S3Server) handleObject(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	bucketName := vars["bucket"]
 	objectKey := vars["object"]
-
+	fmt.Println("handle Obj")
 	// Remove the leading slash if it exists
 	objectKey = strings.TrimPrefix(objectKey, "/")
 	switch r.Method {
@@ -582,7 +582,7 @@ func main() {
 
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		//log.Printf("Received request: %s %s", r.Method, r.URL)
+		log.Printf("Received request: %s %s", r.Method, r.URL)
 		next.ServeHTTP(w, r)
 	})
 }
@@ -750,7 +750,6 @@ func (fs *FileSystemBackend) PutObject(bucket, key string, data []byte, metadata
 		// The directory and its control file have already been created
 		return nil
 	}
-
 	// For regular files
 	// Write the file
 	if err := ioutil.WriteFile(fullPath, data, 0644); err != nil {
