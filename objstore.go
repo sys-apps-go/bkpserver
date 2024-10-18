@@ -92,7 +92,7 @@ type Bucket struct {
 
 type S3Server struct {
 	storage            StorageBackend
-	 multipartUploads sync.Map
+	multipartUploads   sync.Map
 	replicationManager *ReplicationManager
 }
 type ReplicationManager struct {
@@ -1188,7 +1188,6 @@ func (fs *FileSystemBackend) copyFile(src, dst string) error {
 
 	return nil
 }
-
 
 func calculateETag(parts []CompletedPart) string {
 	if len(parts) == 0 {
