@@ -12,6 +12,7 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -523,8 +524,8 @@ func main() {
 		},
 		Action: func(c *cli.Context) error {
 			urlStr := c.String("url")
-			accessKeyID := c.String("access-key-id")
-			secretAccessKey := c.String("secret-access-key")
+			//accessKeyID := c.String("access-key-id")
+			//secretAccessKey := c.String("secret-access-key")
 			filesystemDrive := c.String("filesystem-drive")
 			parsedURL, err := url.Parse(urlStr)
 			if err != nil {
@@ -549,7 +550,7 @@ func main() {
 			r := mux.NewRouter()
 
 			// Apply the authentication middleware to all routes
-			r.Use(authMiddleware(accessKeyID, secretAccessKey))
+			//r.Use(authMiddleware(accessKeyID, secretAccessKey))
 
 			// Define routes
 			r.HandleFunc("/", s3server.handleRoot).Methods("GET")
@@ -564,6 +565,9 @@ func main() {
 				Methods("POST").
 				Queries("uploadId", "{uploadId}")
 			r.HandleFunc("/{bucket}/{object:.+}", s3server.handleObject).Methods("GET", "PUT", "DELETE", "HEAD")
+			r.HandleFunc("/{bucket}", s3server.handleBucketLocation).
+				Methods("GET").
+				Queries("location", "")
 
 			// Add logging middleware
 			r.Use(loggingMiddleware)
@@ -1461,7 +1465,7 @@ func (fs *FileSystemBackend) ListBucket(bucket string) ([]Object, error) {
 	return objects, nil
 }
 
-func authMiddleware(accessKeyID, secretAccessKey string) mux.MiddlewareFunc {
+func authMiddleware1(accessKeyID, secretAccessKey string) mux.MiddlewareFunc {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
@@ -1488,6 +1492,59 @@ func authMiddleware(accessKeyID, secretAccessKey string) mux.MiddlewareFunc {
 		})
 	}
 }
+
+func authMiddleware(accessKeyID, secretAccessKey string) mux.MiddlewareFunc {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var credentials string
+			var signature string
+
+			// Check for Authorization header
+			authHeader := r.Header.Get("Authorization")
+			if authHeader != "" {
+				parts := strings.Fields(authHeader)
+				if len(parts) == 2 && parts[0] == "AWS4-HMAC-SHA256" {
+					credentials = parts[1]
+				}
+			}
+
+			// Check for query string parameters
+			if credentials == "" {
+				credentials = r.URL.Query().Get("X-Amz-Credential")
+				signature = r.URL.Query().Get("X-Amz-Signature")
+			}
+
+			if credentials == "" {
+				log.Println("No valid credentials found")
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+
+			// Parse the credentials
+			credParts := strings.Split(credentials, "/")
+			if len(credParts) < 2 || credParts[0] != accessKeyID {
+				log.Println("Invalid access key ID")
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+
+			// TODO: Implement actual signature verification here
+			// This would involve reconstructing the string to sign,
+			// calculating the signature, and comparing it to the provided signature
+
+			// For now, we'll just check if the signature is present when using query auth
+			if signature == "" && authHeader == "" {
+				log.Println("Missing signature for query string auth")
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+
+			// If we've made it this far, consider the request authenticated
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 func generateUniqueID() string {
 	b := make([]byte, 16)
 	_, err := rand.Read(b)
@@ -1548,4 +1605,47 @@ func (fs *FileSystemBackend) DeleteBucket(bucket string) error {
 	}
 
 	return nil
+}
+
+func (s *S3Server) handleBucketLocation(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	bucket := vars["bucket"]
+
+	// Check if the bucket exists
+	// This is a placeholder - you'll need to implement actual bucket existence checking
+	if !s.storage.BucketExists(bucket) {
+		s.sendErrorResponse(w, "NoSuchBucket", http.StatusNotFound)
+		return
+	}
+
+	// Get the bucket location
+	// This is a placeholder - you'll need to implement actual location retrieval
+	location, _ := s.getBucketLocation(bucket)
+
+	// Create the response
+	response := LocationResponse{
+		Location: location,
+	}
+
+	// Marshal the response to XML
+	xmlResponse, err := xml.MarshalIndent(response, "", "  ")
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	// Set headers and write response
+	w.Header().Set("Content-Type", "application/xml")
+	w.Write([]byte(xml.Header + string(xmlResponse)))
+}
+
+func (s *S3Server) getBucketLocation(bucket string) (string, error) {
+	// This is a placeholder implementation
+	// In a real scenario, you would look up the bucket's location in your storage system
+	return "us-east-1", nil
+}
+
+type LocationResponse struct {
+	XMLName  xml.Name `xml:"LocationConstraint"`
+	Location string   `xml:",chardata"`
 }
