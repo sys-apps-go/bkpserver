@@ -47,6 +47,7 @@ type ObjectMetadata struct {
 type FileSystemBackend struct {
 	dataDir string
 	ctrlMap map[string]bool
+	server  *S3Server
 }
 
 type ObjectInfo struct {
@@ -91,6 +92,7 @@ type Bucket struct {
 
 type S3Server struct {
 	storage            StorageBackend
+	 multipartUploads sync.Map
 	replicationManager *ReplicationManager
 }
 type ReplicationManager struct {
@@ -542,6 +544,7 @@ func main() {
 				os.Exit(1)
 			}
 			s3server := NewS3Server(backend)
+			backend.server = s3server
 
 			r := mux.NewRouter()
 
@@ -997,6 +1000,7 @@ func (fs *FileSystemBackend) PutObjectPart(bucket, key, uploadID string, partNum
 	return nil
 }
 
+/*
 func (fs *FileSystemBackend) CompleteMultipartUpload(bucket, key, uploadID string, parts []CompletedPart) error {
 	uploadDir := filepath.Join(fs.dataDir, bucket, fmt.Sprintf("%s.%s", key, uploadID))
 	finalPath := filepath.Join(fs.dataDir, bucket, key)
@@ -1054,6 +1058,137 @@ func (fs *FileSystemBackend) CompleteMultipartUpload(bucket, key, uploadID strin
 
 	return nil
 }
+*/
+
+func (fs *FileSystemBackend) CompleteMultipartUpload(bucket, key, uploadID string, parts []CompletedPart) error {
+	uploadDir := filepath.Join(fs.dataDir, bucket, fmt.Sprintf("%s.%s", key, uploadID))
+	finalPath := filepath.Join(fs.dataDir, bucket, key)
+
+	// Open the final file
+	finalFile, err := os.Create(finalPath)
+	if err != nil {
+		return fmt.Errorf("failed to create final file: %v", err)
+	}
+	defer finalFile.Close()
+
+	// Sort parts by part number
+	sort.Slice(parts, func(i, j int) bool {
+		return parts[i].PartNumber < parts[j].PartNumber
+	})
+
+	// Combine all parts
+	for _, part := range parts {
+		partPath := filepath.Join(uploadDir, fmt.Sprintf("part.%d", part.PartNumber))
+		partData, err := ioutil.ReadFile(partPath)
+		if err != nil {
+			return fmt.Errorf("failed to read part file: %v", err)
+		}
+
+		_, err = finalFile.Write(partData)
+		if err != nil {
+			return fmt.Errorf("failed to write to final file: %v", err)
+		}
+	}
+
+	// Create control file
+	controlFileName := "." + filepath.Base(key) + ".metadata"
+	controlFilePath := filepath.Join(filepath.Dir(finalPath), controlFileName)
+
+	metadata := map[string]string{
+		"UploadID": uploadID,
+		"Parts":    fmt.Sprintf("%d", len(parts)),
+		// Add any other metadata you want to store
+	}
+
+	metadataJSON, err := json.Marshal(metadata)
+	if err != nil {
+		return fmt.Errorf("failed to marshal metadata: %v", err)
+	}
+
+	if err := ioutil.WriteFile(controlFilePath, metadataJSON, 0644); err != nil {
+		return fmt.Errorf("failed to write control file: %v", err)
+	}
+
+	// Clean up the upload directory
+	if err := os.RemoveAll(uploadDir); err != nil {
+		// Log this error, but don't fail the operation
+		log.Printf("Warning: failed to remove upload directory: %v", err)
+	}
+
+	// Replicate the object to the mirror bucket
+	if replicaBucket, exists := fs.server.replicationManager.GetReplica(bucket); exists {
+		err := fs.replicateObject(bucket, replicaBucket, key)
+		if err != nil {
+			log.Printf("Failed to replicate object %s/%s: %v", bucket, key, err)
+			// Optionally, you could return this error if you want to ensure replication succeeds
+			// return fmt.Errorf("failed to replicate object: %v", err)
+		}
+	}
+
+	return nil
+}
+
+func (fs *FileSystemBackend) replicateObject(sourceBucket, replicaBucket, key string) error {
+	sourcePath := filepath.Join(fs.dataDir, sourceBucket, key)
+	replicaPath := filepath.Join(fs.dataDir, replicaBucket, key)
+
+	// Ensure the replica bucket directory exists
+	replicaBucketDir := filepath.Join(fs.dataDir, replicaBucket)
+	if err := os.MkdirAll(replicaBucketDir, 0755); err != nil {
+		return fmt.Errorf("failed to create replica bucket directory: %v", err)
+	}
+
+	// Copy the object file
+	sourceFile, err := os.Open(sourcePath)
+	if err != nil {
+		return fmt.Errorf("failed to open source file: %v", err)
+	}
+	defer sourceFile.Close()
+
+	replicaFile, err := os.Create(replicaPath)
+	if err != nil {
+		return fmt.Errorf("failed to create replica file: %v", err)
+	}
+	defer replicaFile.Close()
+
+	_, err = io.Copy(replicaFile, sourceFile)
+	if err != nil {
+		return fmt.Errorf("failed to copy file contents: %v", err)
+	}
+
+	// Copy the metadata file
+	sourceMetadataPath := filepath.Join(filepath.Dir(sourcePath), "."+filepath.Base(key)+".metadata")
+	replicaMetadataPath := filepath.Join(filepath.Dir(replicaPath), "."+filepath.Base(key)+".metadata")
+
+	err = fs.copyFile(sourceMetadataPath, replicaMetadataPath)
+	if err != nil {
+		return fmt.Errorf("failed to copy metadata file: %v", err)
+	}
+
+	return nil
+}
+
+func (fs *FileSystemBackend) copyFile(src, dst string) error {
+	sourceFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer sourceFile.Close()
+
+	destFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer destFile.Close()
+
+	_, err = io.Copy(destFile, sourceFile)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 
 func calculateETag(parts []CompletedPart) string {
 	if len(parts) == 0 {
