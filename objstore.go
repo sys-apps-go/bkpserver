@@ -405,7 +405,7 @@ func (s *S3Server) handleObject(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	bucketName := vars["bucket"]
 	objectKey := vars["object"]
-	fmt.Println("handle Obj")
+
 	// Remove the leading slash if it exists
 	objectKey = strings.TrimPrefix(objectKey, "/")
 	switch r.Method {
@@ -552,8 +552,13 @@ func main() {
 			//r.Use(authMiddleware(accessKeyID, secretAccessKey))
 
 			// Define routes
+
 			r.HandleFunc("/", s3server.handleRoot).Methods("GET")
-			r.HandleFunc("/{bucket}", s3server.handleBucket).Methods("GET", "PUT", "DELETE")
+			r.HandleFunc("/{bucket}/", s3server.handleBucketLocation).
+				Methods("GET").
+				Queries("location", "")
+			r.HandleFunc("/{bucket}/", s3server.handleBucket).Methods("GET", "PUT", "DELETE")
+
 			r.HandleFunc("/{bucket}/{object:.+}", s3server.handleNewMultipartUpload).
 				Methods("POST").
 				Queries("uploads", "")
@@ -564,9 +569,9 @@ func main() {
 				Methods("POST").
 				Queries("uploadId", "{uploadId}")
 			r.HandleFunc("/{bucket}/{object:.+}", s3server.handleObject).Methods("GET", "PUT", "DELETE", "HEAD")
-			r.HandleFunc("/{bucket}", s3server.handleBucketLocation).
-				Methods("GET").
-				Queries("location", "")
+
+			r.PathPrefix("/").Handler(loggingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				})))
 
 			// Add logging middleware
 			r.Use(loggingMiddleware)
@@ -588,7 +593,7 @@ func main() {
 
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("Received request: %s %s", r.Method, r.URL)
+		//log.Printf("Received request: %s %s", r.Method, r.URL)
 		next.ServeHTTP(w, r)
 	})
 }
@@ -857,17 +862,10 @@ func (s *S3Server) initiateMultipartUpload(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *S3Server) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Request) {
-	//log.Println("handleCreateMultipartUpload function called")
-
 	vars := mux.Vars(r)
-	//log.Printf("vars: %+v\n", vars)
 
 	bucketName := vars["bucket"]
 	objectKey := vars["key"]
-	//log.Printf("bucketName: %s, objectKey: %s\n", bucketName, objectKey)
-
-	// Log query parameters
-	//log.Printf("Query params: %v\n", r.URL.Query())
 
 	// Initiate the multipart upload
 	uploadID, err := s.storage.InitiateMultipartUpload(bucketName, objectKey)
@@ -1002,66 +1000,6 @@ func (fs *FileSystemBackend) PutObjectPart(bucket, key, uploadID string, partNum
 
 	return nil
 }
-
-/*
-func (fs *FileSystemBackend) CompleteMultipartUpload(bucket, key, uploadID string, parts []CompletedPart) error {
-	uploadDir := filepath.Join(fs.dataDir, bucket, fmt.Sprintf("%s.%s", key, uploadID))
-	finalPath := filepath.Join(fs.dataDir, bucket, key)
-
-	// Open the final file
-	finalFile, err := os.Create(finalPath)
-	if err != nil {
-		return fmt.Errorf("failed to create final file: %v", err)
-	}
-	defer finalFile.Close()
-
-	// Sort parts by part number
-	sort.Slice(parts, func(i, j int) bool {
-		return parts[i].PartNumber < parts[j].PartNumber
-	})
-
-	// Combine all parts
-	for _, part := range parts {
-		partPath := filepath.Join(uploadDir, fmt.Sprintf("part.%d", part.PartNumber))
-		partData, err := ioutil.ReadFile(partPath)
-		if err != nil {
-			return fmt.Errorf("failed to read part file: %v", err)
-		}
-
-		_, err = finalFile.Write(partData)
-		if err != nil {
-			return fmt.Errorf("failed to write to final file: %v", err)
-		}
-	}
-
-	// Create control file
-	controlFileName := "." + filepath.Base(key) + ".metadata"
-	controlFilePath := filepath.Join(filepath.Dir(finalPath), controlFileName)
-
-	metadata := map[string]string{
-		"UploadID": uploadID,
-		"Parts":    fmt.Sprintf("%d", len(parts)),
-		// Add any other metadata you want to store
-	}
-
-	metadataJSON, err := json.Marshal(metadata)
-	if err != nil {
-		return fmt.Errorf("failed to marshal metadata: %v", err)
-	}
-
-	if err := ioutil.WriteFile(controlFilePath, metadataJSON, 0644); err != nil {
-		return fmt.Errorf("failed to write control file: %v", err)
-	}
-
-	// Clean up the upload directory
-	if err := os.RemoveAll(uploadDir); err != nil {
-		// Log this error, but don't fail the operation
-		log.Printf("Warning: failed to remove upload directory: %v", err)
-	}
-
-	return nil
-}
-*/
 
 func (fs *FileSystemBackend) CompleteMultipartUpload(bucket, key, uploadID string, parts []CompletedPart) error {
 	uploadDir := filepath.Join(fs.dataDir, bucket, fmt.Sprintf("%s.%s", key, uploadID))
@@ -1218,8 +1156,7 @@ func calculateETag(parts []CompletedPart) string {
 }
 
 func (s *S3Server) handleHeadObject(w http.ResponseWriter, r *http.Request, bucketName, objectKey string) {
-	//log.Printf("Handling HEAD request for bucket: %s, key: %s", bucketName, objectKey)
-
+	  // Get object metadata
 	metadata, err := s.storage.GetObjectMetadata(bucketName, objectKey)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -1230,17 +1167,22 @@ func (s *S3Server) handleHeadObject(w http.ResponseWriter, r *http.Request, buck
 		return
 	}
 
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", metadata.Size))
-	w.Header().Set("Last-Modified", metadata.LastModified.Format(http.TimeFormat))
-	w.Header().Set("ETag", metadata.ETag)
+        // Set Last-Modified header
+        //lastModified := metadata.LastModified.UTC().Format(time.RFC1123)
+	lastModified := metadata.LastModified.UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")
+        w.Header().Set("Last-Modified", lastModified)
 
-	if metadata.IsDirectory {
-		w.Header().Set("X-Is-Directory", "true")
-	} else {
-		w.Header().Set("X-Is-Directory", "false")
-	}
+        // Set other required headers
+        w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
+        w.Header().Set("ETag", metadata.ETag)
+        w.Header().Set("Accept-Ranges", "bytes")
+        w.Header().Set("Content-Type", "application/octet-stream") // or the actual content type
+        w.Header().Set("x-amz-request-id", generateUniqueID()) // Implement this function
 
-	w.WriteHeader(http.StatusOK)
+        // Log the headers for debugging
+        //log.Printf("Headers for %v/%v: %v", metadata, objectKey, w.Header())
+
+        w.WriteHeader(http.StatusOK)
 	//log.Printf("Successfully responded to HEAD request: bucket=%s, key=%s, size=%d, isDirectory=%v",
 	//	bucketName, objectKey, metadata.Size, metadata.IsDirectory)
 }
@@ -1350,10 +1292,6 @@ func (fs *FileSystemBackend) ListObjectsV2Recursive(bucket, prefix string, maxKe
 		}
 	}
 
-	//fmt.Printf("ListObjectsV2: Found %d objects\n", len(objects))
-	//for _, obj := range objects {
-	//	fmt.Printf("  - Key: %s, IsDirectory: %v\n", obj.Key, obj.IsDirectory)
-	//}
 	return objects, nil
 }
 
