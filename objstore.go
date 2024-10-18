@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"math/rand"
@@ -16,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -87,7 +90,31 @@ type Bucket struct {
 }
 
 type S3Server struct {
-	storage StorageBackend
+	storage            StorageBackend
+	replicationManager *ReplicationManager
+}
+type ReplicationManager struct {
+	mu       sync.Mutex
+	replicas map[string]string // map of source bucket to replica bucket
+}
+
+func NewReplicationManager() *ReplicationManager {
+	return &ReplicationManager{
+		replicas: make(map[string]string),
+	}
+}
+
+func (rm *ReplicationManager) AddReplica(sourceBucket, replicaBucket string) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	rm.replicas[sourceBucket] = replicaBucket
+}
+
+func (rm *ReplicationManager) GetReplica(sourceBucket string) (string, bool) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	replica, exists := rm.replicas[sourceBucket]
+	return replica, exists
 }
 
 func NewFileSystemBackend(dataDir string) (*FileSystemBackend, error) {
@@ -118,16 +145,11 @@ func newFileSystemBackend(dataDir string) error {
 	return nil
 }
 
-// Create buket if not existing
 func (fs *FileSystemBackend) CreateBucket(name string) error {
 	if fs.BucketExists(name) {
 		return nil
 	}
 	return os.Mkdir(filepath.Join(fs.dataDir, name), 0755)
-}
-
-func (fs *FileSystemBackend) DeleteBucket(name string) error {
-	return os.RemoveAll(filepath.Join(fs.dataDir, name))
 }
 
 func (fs *FileSystemBackend) GetObject(bucket, key string) ([]byte, error) {
@@ -141,7 +163,11 @@ func (fs *FileSystemBackend) DeleteObject(bucket, key string) error {
 }
 
 func NewS3Server(storage StorageBackend) *S3Server {
-	return &S3Server{storage: storage}
+	s := &S3Server{
+		storage:            storage,
+		replicationManager: NewReplicationManager(),
+	}
+	return s
 }
 func (s *S3Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/xml")
@@ -334,14 +360,40 @@ func (s *S3Server) handleBucket(w http.ResponseWriter, r *http.Request) {
 			s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
 			return
 		}
+		// Create replica bucket
+		replicaBucket := bucketName + "-replica"
+		err = s.storage.CreateBucket(replicaBucket)
+		if err != nil {
+			http.Error(w, "Failed to create replica bucket: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// Add to replication manager
+		s.replicationManager.AddReplica(bucketName, replicaBucket)
 		w.WriteHeader(http.StatusOK)
 		w.Header().Set("Location", "/"+bucketName)
 	case "DELETE":
-		err := s.storage.DeleteBucket(bucketName)
+		// Check if the bucket has a replica
+		replicaBucket, hasReplica := s.replicationManager.GetReplica(bucketName)
+
+		// Delete the original bucket
+		err := s.deleteBucket(bucketName)
 		if err != nil {
-			s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
+			http.Error(w, fmt.Sprintf("Failed to delete bucket %s: %v", bucketName, err), http.StatusInternalServerError)
 			return
 		}
+
+		// If there's a replica, delete it too
+		if hasReplica {
+			err = s.deleteBucket(replicaBucket)
+			if err != nil {
+				log.Printf("Failed to delete replica bucket %s: %v", replicaBucket, err)
+				// Note: We don't return here because we've already deleted the main bucket
+			}
+			// Remove the replication mapping
+			s.replicationManager.RemoveReplica(bucketName)
+		}
+
 		w.WriteHeader(http.StatusNoContent)
 	}
 
@@ -370,10 +422,6 @@ func (s *S3Server) handleObject(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Write(data)
 	case "PUT":
-		vars := mux.Vars(r)
-		bucketName := vars["bucket"]
-		objectKey := vars["object"]
-
 		// Ensure the bucket exists
 		if !s.storage.BucketExists(bucketName) {
 			s.sendErrorResponse(w, "NoSuchBucket", http.StatusNotFound)
@@ -404,10 +452,15 @@ func (s *S3Server) handleObject(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if replicaBucket, exists := s.replicationManager.GetReplica(bucketName); exists {
+			err := s.replicateObject(bucketName, replicaBucket, objectKey, bytes.NewReader(body))
+			if err != nil {
+				log.Printf("Failed to replicate object %s/%s: %v", bucketName, objectKey, err)
+				// Optionally handle the replication failure
+			}
+		}
 		// Send success response
 		w.WriteHeader(http.StatusOK)
-		// Existing PUT logic
-		// ...
 	case "DELETE":
 		err := s.storage.DeleteObject(bucketName, objectKey)
 		if err != nil {
@@ -1315,3 +1368,51 @@ func formatMinioTime(t time.Time) string {
 	return t.UTC().Format(time.RFC3339Nano)
 }
 
+// Helper function to extract metadata from headers
+func extractMetadata(header http.Header) map[string]string {
+	metadata := make(map[string]string)
+	for key, values := range header {
+		if strings.HasPrefix(strings.ToLower(key), "x-amz-meta-") {
+			metadata[key] = values[0]
+		}
+	}
+	return metadata
+}
+
+func (s *S3Server) replicateObject(sourceBucket, replicaBucket, object string, data io.Reader) error {
+	content, err := ioutil.ReadAll(data)
+	if err != nil {
+		return fmt.Errorf("failed to read object data: %v", err)
+	}
+
+	metadata := make(map[string]string)
+
+	return s.storage.PutObject(replicaBucket, object, content, metadata)
+}
+
+func (rm *ReplicationManager) RemoveReplica(sourceBucket string) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	delete(rm.replicas, sourceBucket)
+}
+
+func (s *S3Server) deleteBucket(bucket string) error {
+	return s.storage.DeleteBucket(bucket)
+}
+
+func (fs *FileSystemBackend) DeleteBucket(bucket string) error {
+	bucketPath := filepath.Join(fs.dataDir, bucket)
+
+	// Check if the bucket exists
+	if _, err := os.Stat(bucketPath); os.IsNotExist(err) {
+		return fmt.Errorf("bucket %s does not exist", bucket)
+	}
+
+	// Remove the bucket directory and all its contents
+	err := os.RemoveAll(bucketPath)
+	if err != nil {
+		return fmt.Errorf("failed to delete bucket %s: %v", bucket, err)
+	}
+
+	return nil
+}
