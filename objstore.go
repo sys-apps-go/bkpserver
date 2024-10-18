@@ -42,6 +42,7 @@ type ObjectMetadata struct {
 	LastModified time.Time
 	ETag         string
 	IsDirectory  bool
+	ContentType  string
 }
 
 type FileSystemBackend struct {
@@ -412,17 +413,38 @@ func (s *S3Server) handleObject(w http.ResponseWriter, r *http.Request) {
 	case "HEAD":
 		s.handleHeadObject(w, r, bucketName, objectKey)
 	case "GET":
-		// Existing GET logic
-		data, err := s.storage.GetObject(bucketName, objectKey)
+		// Get object metadata first
+		metadata, err := s.storage.GetObjectMetadata(bucketName, objectKey, r.Header.Get("Content-Type"))
 		if err != nil {
 			if os.IsNotExist(err) {
 				s.sendErrorResponse(w, "NoSuchKey", http.StatusNotFound)
 			} else {
+				log.Printf("Error getting object metadata: %v", err)
 				s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
 			}
 			return
 		}
-		w.Write(data)
+
+		// Set headers based on metadata
+		w.Header().Set("Content-Type", metadata.ContentType)
+		w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
+		w.Header().Set("ETag", metadata.ETag)
+		lastModified := metadata.LastModified.UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")
+		w.Header().Set("Last-Modified", lastModified)
+
+		// Get the object data
+		data, err := s.storage.GetObject(bucketName, objectKey)
+		if err != nil {
+			log.Printf("Error getting object data: %v", err)
+			s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
+			return
+		}
+
+		// Write the data to the response
+		_, err = w.Write(data)
+		if err != nil {
+			log.Printf("Error writing response: %v", err)
+		}
 	case "PUT":
 		// Ensure the bucket exists
 		if !s.storage.BucketExists(bucketName) {
@@ -607,7 +629,7 @@ type StorageBackend interface {
 	GetObject(bucket, key string) ([]byte, error)
 	DeleteObject(bucket, key string) error
 	BucketExists(name string) bool
-	GetObjectMetadata(bucket, key string) (*ObjectMetadata, error)
+	GetObjectMetadata(bucket, key string, contentType string) (*ObjectMetadata, error)
 	PutObject(bucket string, obj string, data []byte, metadata map[string]string) error
 	InitiateMultipartUpload(bucket, key string) (string, error)
 	PutObjectPart(bucket, key, uploadID string, partNumber int, data []byte) error
@@ -722,7 +744,7 @@ func (s *S3Server) sendErrorResponse(w http.ResponseWriter, code string, status 
 	}
 }
 
-func (fs *FileSystemBackend) GetObjectMetadata(bucket, key string) (*ObjectMetadata, error) {
+func (fs *FileSystemBackend) GetObjectMetadata(bucket, key string, contentType string) (*ObjectMetadata, error) {
 	path := filepath.Join(fs.dataDir, bucket, key)
 	info, err := os.Stat(path)
 	if err != nil {
@@ -733,6 +755,7 @@ func (fs *FileSystemBackend) GetObjectMetadata(bucket, key string) (*ObjectMetad
 		Size:         info.Size(),
 		LastModified: info.ModTime(),
 		IsDirectory:  info.IsDir(),
+		ContentType:  contentType,
 	}
 
 	if !info.IsDir() {
@@ -1157,7 +1180,7 @@ func calculateETag(parts []CompletedPart) string {
 
 func (s *S3Server) handleHeadObject(w http.ResponseWriter, r *http.Request, bucketName, objectKey string) {
 	// Get object metadata
-	metadata, err := s.storage.GetObjectMetadata(bucketName, objectKey)
+	metadata, err := s.storage.GetObjectMetadata(bucketName, objectKey, r.Header.Get("Content-Type"))
 	if err != nil {
 		if os.IsNotExist(err) {
 			s.sendErrorResponse(w, "NoSuchKey", http.StatusNotFound)
