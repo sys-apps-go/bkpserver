@@ -571,7 +571,7 @@ func main() {
 			r.HandleFunc("/{bucket}/{object:.+}", s3server.handleObject).Methods("GET", "PUT", "DELETE", "HEAD")
 
 			r.PathPrefix("/").Handler(loggingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				})))
+			})))
 
 			// Add logging middleware
 			r.Use(loggingMiddleware)
@@ -1156,7 +1156,7 @@ func calculateETag(parts []CompletedPart) string {
 }
 
 func (s *S3Server) handleHeadObject(w http.ResponseWriter, r *http.Request, bucketName, objectKey string) {
-	  // Get object metadata
+	// Get object metadata
 	metadata, err := s.storage.GetObjectMetadata(bucketName, objectKey)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -1167,22 +1167,22 @@ func (s *S3Server) handleHeadObject(w http.ResponseWriter, r *http.Request, buck
 		return
 	}
 
-        // Set Last-Modified header
-        //lastModified := metadata.LastModified.UTC().Format(time.RFC1123)
+	// Set Last-Modified header
+	//lastModified := metadata.LastModified.UTC().Format(time.RFC1123)
 	lastModified := metadata.LastModified.UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")
-        w.Header().Set("Last-Modified", lastModified)
+	w.Header().Set("Last-Modified", lastModified)
 
-        // Set other required headers
-        w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
-        w.Header().Set("ETag", metadata.ETag)
-        w.Header().Set("Accept-Ranges", "bytes")
-        w.Header().Set("Content-Type", "application/octet-stream") // or the actual content type
-        w.Header().Set("x-amz-request-id", generateUniqueID()) // Implement this function
+	// Set other required headers
+	w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
+	w.Header().Set("ETag", metadata.ETag)
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Content-Type", "application/octet-stream") // or the actual content type
+	w.Header().Set("x-amz-request-id", generateUniqueID())     // Implement this function
 
-        // Log the headers for debugging
-        //log.Printf("Headers for %v/%v: %v", metadata, objectKey, w.Header())
+	// Log the headers for debugging
+	//log.Printf("Headers for %v/%v: %v", metadata, objectKey, w.Header())
 
-        w.WriteHeader(http.StatusOK)
+	w.WriteHeader(http.StatusOK)
 	//log.Printf("Successfully responded to HEAD request: bucket=%s, key=%s, size=%d, isDirectory=%v",
 	//	bucketName, objectKey, metadata.Size, metadata.IsDirectory)
 }
