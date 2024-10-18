@@ -86,6 +86,11 @@ type CompleteMultipartUploadResult struct {
 	ETag     string   `xml:"ETag"`
 }
 
+type LocationResponse struct {
+	XMLName  xml.Name `xml:"LocationConstraint"`
+	Location string   `xml:",chardata"`
+}
+
 type Bucket struct {
 	Name         string
 	CreationDate time.Time
@@ -545,8 +550,8 @@ func main() {
 		},
 		Action: func(c *cli.Context) error {
 			urlStr := c.String("url")
-			//accessKeyID := c.String("access-key-id")
-			//secretAccessKey := c.String("secret-access-key")
+			accessKeyID := c.String("access-key-id")
+			secretAccessKey := c.String("secret-access-key")
 			filesystemDrive := c.String("filesystem-drive")
 			parsedURL, err := url.Parse(urlStr)
 			if err != nil {
@@ -571,7 +576,7 @@ func main() {
 			r := mux.NewRouter()
 
 			// Apply the authentication middleware to all routes
-			//r.Use(authMiddleware(accessKeyID, secretAccessKey))
+			r.Use(authMiddleware(accessKeyID, secretAccessKey))
 
 			// Define routes
 
@@ -615,7 +620,7 @@ func main() {
 
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		//log.Printf("Received request: %s %s", r.Method, r.URL)
+		log.Printf("Received request: %s %s", r.Method, r.URL)
 		next.ServeHTTP(w, r)
 	})
 }
@@ -1425,84 +1430,55 @@ func (fs *FileSystemBackend) ListBucket(bucket string) ([]Object, error) {
 	return objects, nil
 }
 
-func authMiddleware1(accessKeyID, secretAccessKey string) mux.MiddlewareFunc {
+func authMiddleware(accessKeyID, secretAccessKey string) mux.MiddlewareFunc {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Extract authentication information
+			authInfo := extractAuthInfo(r)
 
-			// Check for Authorization header
-			authHeader := r.Header.Get("Authorization")
-
-			// Check for query string parameters
-			queryAccessKey := r.URL.Query().Get("X-Amz-Credential")
-
-			if authHeader == "" && queryAccessKey == "" {
-				log.Println("No Authorization header or query credentials")
+			// Validate the authentication
+			if !validateAuth(authInfo, accessKeyID, secretAccessKey) {
 				http.Error(w, "Unauthorized", http.StatusUnauthorized)
 				return
 			}
 
-			// For simplicity, we're just checking if the access key is present
-			// In a real implementation, you'd validate the signature as well
-			if strings.Contains(authHeader, accessKeyID) || strings.Contains(queryAccessKey, accessKeyID) {
-				next.ServeHTTP(w, r)
-			} else {
-				log.Println("Invalid credentials")
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			}
+			// If authentication is successful, proceed to the next handler
+			next.ServeHTTP(w, r)
 		})
 	}
 }
 
-func authMiddleware(accessKeyID, secretAccessKey string) mux.MiddlewareFunc {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			var credentials string
-			var signature string
+func extractAuthInfo(r *http.Request) map[string]string {
+	authInfo := make(map[string]string)
 
-			// Check for Authorization header
-			authHeader := r.Header.Get("Authorization")
-			if authHeader != "" {
-				parts := strings.Fields(authHeader)
-				if len(parts) == 2 && parts[0] == "AWS4-HMAC-SHA256" {
-					credentials = parts[1]
-				}
-			}
-
-			// Check for query string parameters
-			if credentials == "" {
-				credentials = r.URL.Query().Get("X-Amz-Credential")
-				signature = r.URL.Query().Get("X-Amz-Signature")
-			}
-
-			if credentials == "" {
-				log.Println("No valid credentials found")
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
-				return
-			}
-
-			// Parse the credentials
-			credParts := strings.Split(credentials, "/")
-			if len(credParts) < 2 || credParts[0] != accessKeyID {
-				log.Println("Invalid access key ID")
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
-				return
-			}
-
-			// TODO: Implement actual signature verification here
-			// This would involve reconstructing the string to sign,
-			// calculating the signature, and comparing it to the provided signature
-
-			// For now, we'll just check if the signature is present when using query auth
-			if signature == "" && authHeader == "" {
-				log.Println("Missing signature for query string auth")
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
-				return
-			}
-
-			// If we've made it this far, consider the request authenticated
-			next.ServeHTTP(w, r)
-		})
+	// Check Authorization header
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		// Parse Authorization header
+		// This is a simplified example; you'll need to implement proper parsing
+		authInfo["type"] = "header"
+		authInfo["auth"] = auth
+	} else {
+		// Check query parameters
+		authInfo["type"] = "query"
+		authInfo["accessKey"] = r.URL.Query().Get("AWSAccessKeyId")
+		authInfo["signature"] = r.URL.Query().Get("Signature")
+		// Add other necessary query parameters
 	}
+
+	return authInfo
+}
+
+func validateAuth(authInfo map[string]string, accessKeyID, secretAccessKey string) bool {
+	// This is a placeholder implementation
+	if authInfo["type"] == "header" {
+		// Verify header-based auth
+		return strings.Contains(authInfo["auth"], accessKeyID)
+	} else if authInfo["type"] == "query" {
+		// Verify query-based auth
+		return authInfo["accessKey"] == accessKeyID && authInfo["signature"] != ""
+	}
+
+	return false
 }
 
 func generateUniqueID() string {
@@ -1603,9 +1579,4 @@ func (s *S3Server) getBucketLocation(bucket string) (string, error) {
 	// This is a placeholder implementation
 	// In a real scenario, you would look up the bucket's location in your storage system
 	return "us-east-1", nil
-}
-
-type LocationResponse struct {
-	XMLName  xml.Name `xml:"LocationConstraint"`
-	Location string   `xml:",chardata"`
 }
