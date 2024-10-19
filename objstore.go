@@ -1342,7 +1342,7 @@ func (fs *FileSystemBackend) ListObjectsV2(bucket, prefix string, maxKeys int) (
 
 	for _, entry := range entries {
 		relPath := entry.Name()
-		if strings.HasPrefix(relPath, ".") {
+		if strings.HasPrefix(relPath, ".") && strings.HasSuffix(relPath, ".metadata") {
 			continue
 		}
 
