@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
@@ -26,7 +25,9 @@ import (
 )
 
 const (
-	objectStoreDataDir = "/mnt/objsdata/"
+	maxBuckets                = 32
+	objectStoreDataDir        = "/mnt/objsdata/"
+	objectStoreDataDirReplica = "/mnt/objsdatarepl/"
 )
 
 type Object struct {
@@ -43,12 +44,6 @@ type ObjectMetadata struct {
 	ETag         string
 	IsDirectory  bool
 	ContentType  string
-}
-
-type FileSystemBackend struct {
-	dataDir string
-	ctrlMap map[string]bool
-	server  *S3Server
 }
 
 type ObjectInfo struct {
@@ -96,11 +91,18 @@ type Bucket struct {
 	CreationDate time.Time
 }
 
-type S3Server struct {
+type ltosServer struct {
 	storage            StorageBackend
+	dataDir            string
+	dataDirReplica     string
+	fileSystemReplName string
+	bucketNames        map[string]bool
 	multipartUploads   sync.Map
 	replicationManager *ReplicationManager
+	controlFileMap     map[string]bool
+	mu                 sync.Mutex
 }
+
 type ReplicationManager struct {
 	mu       sync.Mutex
 	replicas map[string]string // map of source bucket to replica bucket
@@ -125,62 +127,73 @@ func (rm *ReplicationManager) GetReplica(sourceBucket string) (string, bool) {
 	return replica, exists
 }
 
-func NewFileSystemBackend(dataDir string) (*FileSystemBackend, error) {
+func createFileSystemBackend(dataDir, dataDirRepl string) error {
 	err := newFileSystemBackend(dataDir)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	f := &FileSystemBackend{
-		dataDir: dataDir,
-		ctrlMap: make(map[string]bool),
-	}
-	return f, nil
-}
-
-func newFileSystemBackend(dataDir string) error {
-	if _, err := os.Stat(dataDir); os.IsNotExist(err) {
-		err := os.MkdirAll(dataDir, 0755)
-		if err != nil {
-			fmt.Printf("Failed to create directory, please create directory %v\n", dataDir)
-			return fmt.Errorf("failed to create base data directory: %v", err)
-		}
-	}
-
-	if _, err := os.Stat(dataDir); os.IsNotExist(err) {
-		fmt.Printf("Failed to create directory, please create directory %v as root\n", dataDir)
-		return fmt.Errorf("base data directory does not exist after creation attempt: %v", err)
+	err = newFileSystemBackend(dataDirRepl)
+	if err != nil {
+		return err
 	}
 	return nil
 }
 
-func (fs *FileSystemBackend) CreateBucket(name string) error {
-	if fs.BucketExists(name) {
-		return nil
+func newFileSystemBackend(dataDir string) error {
+	if _, err := os.Stat(dataDir); os.IsNotExist(err) {
+		os.MkdirAll(dataDir, 0755)
 	}
-	return os.Mkdir(filepath.Join(fs.dataDir, name), 0755)
+
+	if _, err := os.Stat(dataDir); os.IsNotExist(err) {
+		fmt.Printf("Failed to create directory %v\n", dataDir)
+		return err
+	}
+	return nil
 }
 
-func (fs *FileSystemBackend) GetObject(bucket, key string) ([]byte, error) {
-	path := filepath.Join(fs.dataDir, bucket, key)
+func (s *ltosServer) CreateBucket(name string) error {
+	if s.BucketExists(name) {
+		return nil
+	}
+	return os.Mkdir(filepath.Join(s.dataDir, name), 0755)
+}
+
+func (s *ltosServer) CreateBucketReplica(name string) error {
+	if s.BucketExistsReplica(name) {
+		return nil
+	}
+	return os.Mkdir(filepath.Join(s.dataDirReplica, name), 0755)
+}
+
+func (s *ltosServer) GetObject(bucket, key string) ([]byte, error) {
+	path := filepath.Join(s.dataDir, bucket, key)
 	return ioutil.ReadFile(path)
 }
 
-func (fs *FileSystemBackend) DeleteObject(bucket, key string) error {
-	path := filepath.Join(fs.dataDir, bucket, key)
+func (s *ltosServer) DeleteObject(bucket, key string) error {
+	path := filepath.Join(s.dataDir, bucket, key)
 	return os.RemoveAll(path)
 }
 
-func NewS3Server(storage StorageBackend) *S3Server {
-	s := &S3Server{
-		storage:            storage,
+func newLiteObjectStoreServer(primaryFs, replicaFs string) *ltosServer {
+	err := createFileSystemBackend(primaryFs, replicaFs)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+	s := &ltosServer{
+		dataDir:            primaryFs,
+		dataDirReplica:     replicaFs,
 		replicationManager: NewReplicationManager(),
+		controlFileMap:     make(map[string]bool),
 	}
 	return s
 }
-func (s *S3Server) handleRoot(w http.ResponseWriter, r *http.Request) {
+
+func (s *ltosServer) handleRoot(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/xml")
 
-	buckets, err := s.storage.ListBuckets()
+	buckets, err := s.ListBuckets()
 	if err != nil {
 		s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
 		return
@@ -206,7 +219,7 @@ func (s *S3Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 			DisplayName string `xml:"DisplayName"`
 		}{
 			ID:          "123456789",
-			DisplayName: "S3ServerOwner",
+			DisplayName: "ltosServerOwner",
 		},
 	}
 
@@ -228,7 +241,14 @@ func (s *S3Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *S3Server) handleBucket(w http.ResponseWriter, r *http.Request) {
+/* Do the following:
+ * Put: Create the bucket
+ * Head: Get Bucket Status
+ * Get: List all files and prefixes under bucket name
+ * Delete: Delete the bucket
+ */
+
+func (s *ltosServer) handleBucketCmds(w http.ResponseWriter, r *http.Request) {
 	var objects []Object
 	var err error
 	bucketName := mux.Vars(r)["bucket"]
@@ -241,19 +261,20 @@ func (s *S3Server) handleBucket(w http.ResponseWriter, r *http.Request) {
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
-
 	switch r.Method {
+	case "HEAD":
+		s.handleHeadCmdBucket(w, r, bucketName)
 	case "GET":
-		if !s.storage.BucketExists(bucketName) {
+		if !s.BucketExists(bucketName) {
 			s.sendErrorResponse(w, "NoSuchBucket", http.StatusNotFound)
 			return
 		}
 		if prefix == "" {
-			objects, err = s.storage.ListBucket(bucketName)
+			objects, err = s.ListObjectsV2(bucketName, prefix, maxKeys)
 		} else if listType == 2 {
-			objects, err = s.storage.ListObjectsV2(bucketName, prefix, maxKeys)
+			objects, err = s.ListObjectsV2(bucketName, prefix, maxKeys)
 		} else {
-			objects, err = s.storage.ListObjects(bucketName)
+			objects, err = s.ListObjects(bucketName)
 		}
 
 		if err != nil {
@@ -362,14 +383,14 @@ func (s *S3Server) handleBucket(w http.ResponseWriter, r *http.Request) {
 			s.sendErrorResponse(w, "InvalidBucketName", http.StatusBadRequest)
 			return
 		}
-		err := s.storage.CreateBucket(bucketName)
+		err := s.CreateBucket(bucketName)
 		if err != nil {
 			s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
 			return
 		}
 		// Create replica bucket
-		replicaBucket := bucketName + "-replica"
-		err = s.storage.CreateBucket(replicaBucket)
+		replicaBucket := bucketName
+		err = s.CreateBucketReplica(replicaBucket)
 		if err != nil {
 			http.Error(w, "Failed to create replica bucket: "+err.Error(), http.StatusInternalServerError)
 			return
@@ -406,10 +427,20 @@ func (s *S3Server) handleBucket(w http.ResponseWriter, r *http.Request) {
 
 }
 
-func (s *S3Server) handleObject(w http.ResponseWriter, r *http.Request) {
+func (s *ltosServer) handleObject(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	bucketName := vars["bucket"]
 	objectKey := vars["object"]
+
+	if !s.BucketExists(bucketName) {
+		s.sendErrorResponse(w, "NoSuchBucket", http.StatusNotFound)
+		return
+	}
+
+	isDir := false
+	if strings.HasSuffix(objectKey, "/") {
+		isDir = true
+	}
 	// Remove the leading slash if it exists
 	objectKey = strings.TrimPrefix(objectKey, "/")
 	switch r.Method {
@@ -417,7 +448,7 @@ func (s *S3Server) handleObject(w http.ResponseWriter, r *http.Request) {
 		s.handleHeadObject(w, r, bucketName, objectKey)
 	case "GET":
 		// Get object metadata first
-		metadata, err := s.storage.GetObjectMetadata(bucketName, objectKey, r.Header.Get("Content-Type"))
+		metadata, err := s.GetObjectMetadata(bucketName, objectKey, r.Header.Get("Content-Type"))
 		if err != nil {
 			if os.IsNotExist(err) {
 				s.sendErrorResponse(w, "NoSuchKey", http.StatusNotFound)
@@ -435,8 +466,13 @@ func (s *S3Server) handleObject(w http.ResponseWriter, r *http.Request) {
 		lastModified := metadata.LastModified.UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")
 		w.Header().Set("Last-Modified", lastModified)
 
+		if isDir {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
 		// Get the object data
-		data, err := s.storage.GetObject(bucketName, objectKey)
+		data, err := s.GetObject(bucketName, objectKey)
 		if err != nil {
 			log.Printf("Error getting object data: %v", err)
 			s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
@@ -449,12 +485,10 @@ func (s *S3Server) handleObject(w http.ResponseWriter, r *http.Request) {
 			log.Printf("Error writing response: %v", err)
 		}
 	case "PUT":
-		// Ensure the bucket exists
-		if !s.storage.BucketExists(bucketName) {
-			s.sendErrorResponse(w, "NoSuchBucket", http.StatusNotFound)
+		if isDir {
+			s.createDirCtrFiles(bucketName, objectKey)
 			return
 		}
-
 		// Read the request body
 		body, err := ioutil.ReadAll(r.Body)
 		if err != nil {
@@ -472,24 +506,22 @@ func (s *S3Server) handleObject(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Store the object and its metadata
-		err = s.storage.PutObject(bucketName, objectKey, body, metadata)
+		err = s.PutObject(bucketName, objectKey, body, metadata, isDir)
 		if err != nil {
 			log.Printf("Error storing object: %v", err)
 			s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
 			return
 		}
 
-		if replicaBucket, exists := s.replicationManager.GetReplica(bucketName); exists {
-			err := s.replicateObject(bucketName, replicaBucket, objectKey, bytes.NewReader(body))
-			if err != nil {
-				log.Printf("Failed to replicate object %s/%s: %v", bucketName, objectKey, err)
-				// Optionally handle the replication failure
-			}
+		err = s.replicateObject(bucketName, objectKey, body)
+		if err != nil {
+			log.Printf("Failed to replicate object %s/%s: %v", bucketName, objectKey, err)
+			// Optionally handle the replication failure
 		}
 		// Send success response
 		w.WriteHeader(http.StatusOK)
 	case "DELETE":
-		err := s.storage.DeleteObject(bucketName, objectKey)
+		err := s.DeleteObject(bucketName, objectKey)
 		if err != nil {
 			s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
 			return
@@ -545,12 +577,20 @@ func main() {
 				Value:   objectStoreDataDir,
 				Usage:   "Filesystem directory for ObjStore",
 			},
+			&cli.StringFlag{
+				Name:    "filesystem-replicate-drive",
+				Aliases: []string{"r"},
+				Value:   objectStoreDataDirReplica,
+				Usage:   "Filesystem directory for ObjStore Replica",
+			},
 		},
 		Action: func(c *cli.Context) error {
 			urlStr := c.String("url")
 			accessKeyID := c.String("access-key-id")
 			secretAccessKey := c.String("secret-access-key")
 			filesystemDrive := c.String("filesystem-drive")
+			filesystemReplicaDrive := c.String("filesystem-replicate-drive")
+
 			parsedURL, err := url.Parse(urlStr)
 			if err != nil {
 				return fmt.Errorf("invalid URL: %w", err)
@@ -562,14 +602,7 @@ func main() {
 				port = "50051" // Default port if none specified
 			}
 
-			// Initialize the backend and server
-			backend, err := NewFileSystemBackend(filesystemDrive)
-			if err != nil {
-				fmt.Println(err)
-				os.Exit(1)
-			}
-			s3server := NewS3Server(backend)
-			backend.server = s3server
+			ltosServer := newLiteObjectStoreServer(filesystemDrive, filesystemReplicaDrive)
 
 			r := mux.NewRouter()
 
@@ -578,22 +611,22 @@ func main() {
 
 			// Define routes
 
-			r.HandleFunc("/", s3server.handleRoot).Methods("GET")
-			r.HandleFunc("/{bucket}", s3server.handleBucket).Methods("GET", "PUT", "DELETE")
-			r.HandleFunc("/{bucket}/", s3server.handleBucketLocation).
+			r.HandleFunc("/", ltosServer.handleRoot).Methods("GET")
+			r.HandleFunc("/{bucket}", ltosServer.handleBucketCmds).Methods("GET", "PUT", "DELETE")
+			r.HandleFunc("/{bucket}/", ltosServer.handleBucketCmdsLocation).
 				Methods("GET").
 				Queries("location", "")
 
-			r.HandleFunc("/{bucket}/{object:.+}", s3server.handleNewMultipartUpload).
+			r.HandleFunc("/{bucket}/{object:.+}", ltosServer.handleNewMultipartUpload).
 				Methods("POST").
 				Queries("uploads", "")
-			r.HandleFunc("/{bucket}/{object:.+}", s3server.handleUploadPart).
+			r.HandleFunc("/{bucket}/{object:.+}", ltosServer.handleUploadPart).
 				Methods("PUT").
 				Queries("partNumber", "{partNumber:[0-9]+}", "uploadId", "{uploadId}")
-			r.HandleFunc("/{bucket}/{object:.+}", s3server.handleCompleteMultipartUpload).
+			r.HandleFunc("/{bucket}/{object:.+}", ltosServer.handleCompleteMultipartUpload).
 				Methods("POST").
 				Queries("uploadId", "{uploadId}")
-			r.HandleFunc("/{bucket}/{object:.+}", s3server.handleObject).Methods("GET", "PUT", "DELETE", "HEAD")
+			r.HandleFunc("/{bucket}/{object:.+}", ltosServer.handleObject).Methods("GET", "PUT", "DELETE", "HEAD")
 
 			r.PathPrefix("/").Handler(loggingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			})))
@@ -618,7 +651,7 @@ func main() {
 
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("Received request: %s %s", r.Method, r.URL)
+		//log.Printf("Received request: %s %s", r.Method, r.URL)
 		next.ServeHTTP(w, r)
 	})
 }
@@ -632,8 +665,9 @@ type StorageBackend interface {
 	GetObject(bucket, key string) ([]byte, error)
 	DeleteObject(bucket, key string) error
 	BucketExists(name string) bool
+	BucketReplicaExists(name string) bool
 	GetObjectMetadata(bucket, key string, contentType string) (*ObjectMetadata, error)
-	PutObject(bucket string, obj string, data []byte, metadata map[string]string) error
+	PutObject(bucket string, obj string, data []byte, metadata map[string]string, sDir bool) error
 	InitiateMultipartUpload(bucket, key string) (string, error)
 	PutObjectPart(bucket, key, uploadID string, partNumber int, data []byte) error
 	CompleteMultipartUpload(bucket, key, uploadID string, parts []CompletedPart) error
@@ -641,8 +675,8 @@ type StorageBackend interface {
 	ListObjectsV2(bucket, prefix string, maxKeys int) ([]Object, error)
 }
 
-func (fs *FileSystemBackend) IsPrefix(bucket, prefix string) (bool, error) {
-	dirPath := filepath.Join(fs.dataDir, bucket, prefix)
+func (s *ltosServer) IsPrefix(bucket, prefix string) (bool, error) {
+	dirPath := filepath.Join(s.dataDir, bucket, prefix)
 	files, err := ioutil.ReadDir(dirPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -653,13 +687,18 @@ func (fs *FileSystemBackend) IsPrefix(bucket, prefix string) (bool, error) {
 	return len(files) > 0, nil
 }
 
-func (fs *FileSystemBackend) BucketExists(name string) bool {
-	_, err := os.Stat(filepath.Join(fs.dataDir, name))
+func (s *ltosServer) BucketExists(name string) bool {
+	_, err := os.Stat(filepath.Join(s.dataDir, name))
 	return !os.IsNotExist(err)
 }
 
-func (fs *FileSystemBackend) ListObjects(bucket string) ([]Object, error) {
-	bucketPath := filepath.Join(fs.dataDir, bucket)
+func (s *ltosServer) BucketExistsReplica(name string) bool {
+	_, err := os.Stat(filepath.Join(s.dataDirReplica, name))
+	return !os.IsNotExist(err)
+}
+
+func (s *ltosServer) ListObjects(bucket string) ([]Object, error) {
+	bucketPath := filepath.Join(s.dataDir, bucket)
 	var objects []Object
 
 	err := filepath.Walk(bucketPath, func(path string, info os.FileInfo, err error) error {
@@ -709,8 +748,8 @@ func (fs *FileSystemBackend) ListObjects(bucket string) ([]Object, error) {
 	return objects, nil
 }
 
-func (fs *FileSystemBackend) ListBuckets() ([]Bucket, error) {
-	files, err := ioutil.ReadDir(fs.dataDir)
+func (s *ltosServer) ListBuckets() ([]Bucket, error) {
+	files, err := ioutil.ReadDir(s.dataDir)
 	if err != nil {
 		return nil, err
 	}
@@ -727,7 +766,7 @@ func (fs *FileSystemBackend) ListBuckets() ([]Bucket, error) {
 	return buckets, nil
 }
 
-func (s *S3Server) sendErrorResponse(w http.ResponseWriter, code string, status int) {
+func (s *ltosServer) sendErrorResponse(w http.ResponseWriter, code string, status int) {
 	w.WriteHeader(status)
 	w.Header().Set("Content-Type", "application/xml")
 
@@ -747,8 +786,8 @@ func (s *S3Server) sendErrorResponse(w http.ResponseWriter, code string, status 
 	}
 }
 
-func (fs *FileSystemBackend) GetObjectMetadata(bucket, key string, contentType string) (*ObjectMetadata, error) {
-	path := filepath.Join(fs.dataDir, bucket, key)
+func (s *ltosServer) GetObjectMetadata(bucket, key string, contentType string) (*ObjectMetadata, error) {
+	path := filepath.Join(s.dataDir, bucket, key)
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, err
@@ -773,11 +812,15 @@ func (fs *FileSystemBackend) GetObjectMetadata(bucket, key string, contentType s
 	return metadata, nil
 }
 
-func (fs *FileSystemBackend) PutObject(bucket, key string, data []byte, metadata map[string]string) error {
-	fullPath := filepath.Join(fs.dataDir, bucket, key)
+func (s *ltosServer) PutObject(bucket, key string, data []byte, metadata map[string]string, isDir bool) error {
+	fullPath := filepath.Join(s.dataDir, bucket, key)
 
 	// Ensure all parent directories exist and create control files for them
-	err := fs.createDirectoriesAndControlFiles(bucket, filepath.Dir(key))
+	err := s.createDirectoriesAndControlFiles(s.dataDir, bucket, key, isDir)
+	if err != nil {
+		return err
+	}
+	err = s.createDirectoriesAndControlFiles(s.dataDirReplica, bucket, key, isDir)
 	if err != nil {
 		return err
 	}
@@ -806,17 +849,36 @@ func (fs *FileSystemBackend) PutObject(bucket, key string, data []byte, metadata
 	return nil
 }
 
-func (fs *FileSystemBackend) createDirectoriesAndControlFiles(bucket, key string) error {
-	fullPath := filepath.Join(fs.dataDir, bucket, key)
-	os.MkdirAll(fullPath, 0755)
-
-	_, exists := fs.ctrlMap[key]
-	if exists {
-		return nil
+func (s *ltosServer) createDirectoriesAndControlFiles(dataDir, bucket, objectKey string, isDir bool) error {
+	fullPath := filepath.Join(s.dataDir, bucket, objectKey)
+	if isDir {
+		os.MkdirAll(fullPath, 0755)
+	} else {
+		os.MkdirAll(filepath.Dir(fullPath), 0755)
 	}
 
-	controlFileName := "." + filepath.Base(fullPath) + ".metadata"
-	controlFilePath := filepath.Join(filepath.Dir(fullPath), controlFileName)
+	s.mu.Lock()
+	_, exists := s.controlFileMap[fullPath]
+	if exists {
+		s.mu.Unlock()
+		return nil
+	}
+	s.mu.Unlock()
+
+	if strings.HasSuffix(objectKey, "/") {
+		objectKey = objectKey[0 : len(objectKey)-1]
+	}
+	base, dir := splitBaseDir(objectKey)
+
+	objectCtrl := base
+	if !strings.HasPrefix(objectCtrl, ".") {
+		objectCtrl = "." + objectCtrl
+	}
+	if strings.HasSuffix(objectCtrl, "/") {
+		objectCtrl = objectCtrl[0 : len(objectCtrl)-1]
+	}
+	objectCtrl = objectCtrl + ".metadata"
+	controlFilePath := filepath.Join(dataDir, bucket, dir, objectCtrl)
 
 	if _, err := os.Stat(controlFilePath); os.IsNotExist(err) {
 		metadata := map[string]string{
@@ -831,11 +893,13 @@ func (fs *FileSystemBackend) createDirectoriesAndControlFiles(bucket, key string
 			return fmt.Errorf("failed to write control file: %v", err)
 		}
 	}
-	fs.ctrlMap[key] = true
+	s.mu.Lock()
+	s.controlFileMap[fullPath] = true
+	s.mu.Unlock()
 	return nil
 }
 
-func (s *S3Server) handleMultipartUpload(w http.ResponseWriter, r *http.Request) {
+func (s *ltosServer) handleMultipartUpload(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	bucketName := vars["bucket"]
 	objectKey := vars["object"]
@@ -852,9 +916,9 @@ func (s *S3Server) handleMultipartUpload(w http.ResponseWriter, r *http.Request)
 	}
 }
 
-func (fs *FileSystemBackend) InitiateMultipartUpload(bucket, key string) (string, error) {
+func (s *ltosServer) InitiateMultipartUpload(bucket, key string) (string, error) {
 	uploadID := generateUploadID()
-	uploadDir := filepath.Join(fs.dataDir, bucket, fmt.Sprintf("%s.%s", key, uploadID))
+	uploadDir := filepath.Join(s.dataDir, bucket, fmt.Sprintf("%s.%s", key, uploadID))
 	err := os.MkdirAll(uploadDir, 0755)
 	if err != nil {
 		return "", err
@@ -862,9 +926,9 @@ func (fs *FileSystemBackend) InitiateMultipartUpload(bucket, key string) (string
 	return uploadID, nil
 }
 
-func (s *S3Server) initiateMultipartUpload(w http.ResponseWriter, r *http.Request, bucketName, objectKey string) {
+func (s *ltosServer) initiateMultipartUpload(w http.ResponseWriter, r *http.Request, bucketName, objectKey string) {
 	// Generate upload ID
-	uploadID, err := s.storage.InitiateMultipartUpload(bucketName, objectKey)
+	uploadID, err := s.InitiateMultipartUpload(bucketName, objectKey)
 	if err != nil {
 		s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
 		return
@@ -887,14 +951,14 @@ func (s *S3Server) initiateMultipartUpload(w http.ResponseWriter, r *http.Reques
 	xml.NewEncoder(w).Encode(response)
 }
 
-func (s *S3Server) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Request) {
+func (s *ltosServer) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 
 	bucketName := vars["bucket"]
 	objectKey := vars["key"]
 
 	// Initiate the multipart upload
-	uploadID, err := s.storage.InitiateMultipartUpload(bucketName, objectKey)
+	uploadID, err := s.InitiateMultipartUpload(bucketName, objectKey)
 	if err != nil {
 		s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
 		return
@@ -920,7 +984,7 @@ func (s *S3Server) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Re
 	xml.NewEncoder(w).Encode(response)
 }
 
-func (s *S3Server) handleNewMultipartUpload(w http.ResponseWriter, r *http.Request) {
+func (s *ltosServer) handleNewMultipartUpload(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	bucketName := vars["bucket"]
 	objectKey := vars["object"]
@@ -928,7 +992,7 @@ func (s *S3Server) handleNewMultipartUpload(w http.ResponseWriter, r *http.Reque
 	// Generate a unique upload ID
 	//uploadID := generateUploadID()
 	// Store initial multipart upload info in your backend
-	uploadID, err := s.storage.InitiateMultipartUpload(bucketName, objectKey)
+	uploadID, err := s.InitiateMultipartUpload(bucketName, objectKey)
 	if err != nil {
 		s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
 		return
@@ -951,7 +1015,7 @@ func generateUploadID() string {
 	return fmt.Sprintf("%d", time.Now().UnixNano())
 }
 
-func (s *S3Server) handleUploadPart(w http.ResponseWriter, r *http.Request) {
+func (s *ltosServer) handleUploadPart(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	bucketName := vars["bucket"]
 	objectKey := vars["object"]
@@ -967,7 +1031,7 @@ func (s *S3Server) handleUploadPart(w http.ResponseWriter, r *http.Request) {
 		s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
 		return
 	}
-	err = s.storage.PutObjectPart(bucketName, objectKey, uploadID, partNumber, body)
+	err = s.PutObjectPart(bucketName, objectKey, uploadID, partNumber, body)
 	if err != nil {
 		log.Printf("Error uploading part: %v", err)
 		s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
@@ -981,7 +1045,7 @@ func (s *S3Server) handleUploadPart(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func (s *S3Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Request) {
+func (s *ltosServer) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	bucketName := vars["bucket"]
 	objectKey := vars["object"]
@@ -993,7 +1057,7 @@ func (s *S3Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.
 		return
 	}
 
-	err := s.storage.CompleteMultipartUpload(bucketName, objectKey, uploadID, completeMultipartUpload.Parts)
+	err := s.CompleteMultipartUpload(bucketName, objectKey, uploadID, completeMultipartUpload.Parts)
 	if err != nil {
 		s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
 		return
@@ -1011,9 +1075,9 @@ func (s *S3Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.
 	xml.NewEncoder(w).Encode(response)
 }
 
-func (fs *FileSystemBackend) PutObjectPart(bucket, key, uploadID string, partNumber int, data []byte) error {
+func (s *ltosServer) PutObjectPart(bucket, key, uploadID string, partNumber int, data []byte) error {
 	// Create the directory for this multipart upload if it doesn't exist
-	uploadDir := filepath.Join(fs.dataDir, bucket, fmt.Sprintf("%s.%s", key, uploadID))
+	uploadDir := filepath.Join(s.dataDir, bucket, fmt.Sprintf("%s.%s", key, uploadID))
 	if err := os.MkdirAll(uploadDir, 0755); err != nil {
 		return fmt.Errorf("failed to create upload directory: %v", err)
 	}
@@ -1027,9 +1091,9 @@ func (fs *FileSystemBackend) PutObjectPart(bucket, key, uploadID string, partNum
 	return nil
 }
 
-func (fs *FileSystemBackend) CompleteMultipartUpload(bucket, key, uploadID string, parts []CompletedPart) error {
-	uploadDir := filepath.Join(fs.dataDir, bucket, fmt.Sprintf("%s.%s", key, uploadID))
-	finalPath := filepath.Join(fs.dataDir, bucket, key)
+func (s *ltosServer) CompleteMultipartUpload(bucket, key, uploadID string, parts []CompletedPart) error {
+	uploadDir := filepath.Join(s.dataDir, bucket, fmt.Sprintf("%s.%s", key, uploadID))
+	finalPath := filepath.Join(s.dataDir, bucket, key)
 
 	// Open the final file
 	finalFile, err := os.Create(finalPath)
@@ -1082,60 +1146,77 @@ func (fs *FileSystemBackend) CompleteMultipartUpload(bucket, key, uploadID strin
 		log.Printf("Warning: failed to remove upload directory: %v", err)
 	}
 
-	// Replicate the object to the mirror bucket
-	if replicaBucket, exists := fs.server.replicationManager.GetReplica(bucket); exists {
-		err := fs.replicateObject(bucket, replicaBucket, key)
-		if err != nil {
-			log.Printf("Failed to replicate object %s/%s: %v", bucket, key, err)
-			// Optionally, you could return this error if you want to ensure replication succeeds
-			// return fmt.Errorf("failed to replicate object: %v", err)
-		}
+	// Replica the object to the mirror bucket
+	err = s.replicateObjectFileCopy(bucket, key)
+	if err != nil {
+		log.Printf("Failed to replicate object %s/%s: %v", bucket, key, err)
+		// Optionally, you could return this error if you want to ensure replication succeeds
+		// return fmt.Errorf("failed to replicate object: %v", err)
 	}
 
 	return nil
 }
 
-func (fs *FileSystemBackend) replicateObject(sourceBucket, replicaBucket, key string) error {
-	sourcePath := filepath.Join(fs.dataDir, sourceBucket, key)
-	replicaPath := filepath.Join(fs.dataDir, replicaBucket, key)
+func (s *ltosServer) replicateObject(bucketName, key string, data []byte) error {
+	replicaPath := filepath.Join(s.dataDirReplica, bucketName, key)
 
-	// Ensure the replica bucket directory exists
-	replicaBucketDir := filepath.Join(fs.dataDir, replicaBucket)
-	if err := os.MkdirAll(replicaBucketDir, 0755); err != nil {
-		return fmt.Errorf("failed to create replica bucket directory: %v", err)
+	// Ensure the directory structure exists
+	dir := filepath.Dir(replicaPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory structure: %v", err)
 	}
 
-	// Copy the object file
-	sourceFile, err := os.Open(sourcePath)
-	if err != nil {
-		return fmt.Errorf("failed to open source file: %v", err)
-	}
-	defer sourceFile.Close()
-
+	// Create the file
 	replicaFile, err := os.Create(replicaPath)
 	if err != nil {
 		return fmt.Errorf("failed to create replica file: %v", err)
 	}
 	defer replicaFile.Close()
 
+	// Write the data to the file
+	_, err = replicaFile.Write(data)
+	if err != nil {
+		return fmt.Errorf("failed to write file contents: %v", err)
+	}
+	s.createCtrFile(s.dataDirReplica, bucketName, key)
+
+	return nil
+}
+
+func (s *ltosServer) replicateObjectFileCopy(bucketName, key string) error {
+	sourcePath := filepath.Join(s.dataDir, bucketName, key)
+	replicaPath := filepath.Join(s.dataDirReplica, bucketName, key)
+
+	// Ensure the directory structure exists
+	dir := filepath.Dir(replicaPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory structure: %v", err)
+	}
+
+	// Open the source file
+	sourceFile, err := os.Open(sourcePath)
+	if err != nil {
+		return fmt.Errorf("failed to open source file: %v", err)
+	}
+	defer sourceFile.Close()
+
+	// Create the replica file
+	replicaFile, err := os.Create(replicaPath)
+	if err != nil {
+		return fmt.Errorf("failed to create replica file: %v", err)
+	}
+	defer replicaFile.Close()
+
+	// Copy the contents
 	_, err = io.Copy(replicaFile, sourceFile)
 	if err != nil {
 		return fmt.Errorf("failed to copy file contents: %v", err)
 	}
 
-	// Copy the metadata file
-	sourceMetadataPath := filepath.Join(filepath.Dir(sourcePath), "."+filepath.Base(key)+".metadata")
-	replicaMetadataPath := filepath.Join(filepath.Dir(replicaPath), "."+filepath.Base(key)+".metadata")
-
-	err = fs.copyFile(sourceMetadataPath, replicaMetadataPath)
-	if err != nil {
-		return fmt.Errorf("failed to copy metadata file: %v", err)
-	}
-
 	return nil
 }
 
-func (fs *FileSystemBackend) copyFile(src, dst string) error {
+func (s *ltosServer) copyFile(src, dst string) error {
 	sourceFile, err := os.Open(src)
 	if err != nil {
 		return err
@@ -1181,9 +1262,42 @@ func calculateETag(parts []CompletedPart) string {
 	return fmt.Sprintf("%s-%d", finalETag, len(parts))
 }
 
-func (s *S3Server) handleHeadObject(w http.ResponseWriter, r *http.Request, bucketName, objectKey string) {
+func (s *ltosServer) handleHeadCmdBucket(w http.ResponseWriter, r *http.Request, bucketName string) error {
+	path := filepath.Join(s.dataDir, bucketName)
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.Error(w, "Bucket not found", http.StatusNotFound)
+		} else {
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+		}
+		return err
+	}
+
+	if !info.IsDir() {
+		http.Error(w, "Not a bucket", http.StatusBadRequest)
+		return fmt.Errorf("not a bucket: %s", bucketName)
+	}
+
+	// Set Last-Modified header
+	lastModified := info.ModTime().UTC().Format(time.RFC1123)
+	w.Header().Set("Last-Modified", lastModified)
+
+	// Set other required headers
+	w.Header().Set("Content-Length", "0") // Directories typically have no content
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("x-amz-request-id", generateUniqueID())
+
+	// Optionally set ETag for bucket
+	// w.Header().Set("ETag", calculateBucketETag(bucketName))
+
+	w.WriteHeader(http.StatusOK)
+	return nil
+}
+
+func (s *ltosServer) handleHeadObject(w http.ResponseWriter, r *http.Request, bucketName, objectKey string) {
 	// Get object metadata
-	metadata, err := s.storage.GetObjectMetadata(bucketName, objectKey, r.Header.Get("Content-Type"))
+	metadata, err := s.GetObjectMetadata(bucketName, objectKey, r.Header.Get("Content-Type"))
 	if err != nil {
 		if os.IsNotExist(err) {
 			s.sendErrorResponse(w, "NoSuchKey", http.StatusNotFound)
@@ -1223,12 +1337,12 @@ func isHidden(path string) bool {
 	return false
 }
 
-func (fs *FileSystemBackend) ListObjectsV2Recursive(bucket, prefix string, maxKeys int) ([]Object, error) {
+func (s *ltosServer) ListObjectsV2Recursive(bucket, prefix string, maxKeys int) ([]Object, error) {
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
 
-	bucketPath := filepath.Join(fs.dataDir, bucket)
+	bucketPath := filepath.Join(s.dataDir, bucket)
 	prefixPath := filepath.Join(bucketPath, prefix)
 
 	var objects []Object
@@ -1255,7 +1369,6 @@ func (fs *FileSystemBackend) ListObjectsV2Recursive(bucket, prefix string, maxKe
 		}
 
 		relPath = filepath.ToSlash(relPath)
-
 		if prefix == "" || strings.HasPrefix(relPath, prefix) {
 			if info.IsDir() {
 				if relPath != prefix && relPath != "." {
@@ -1321,12 +1434,12 @@ func (fs *FileSystemBackend) ListObjectsV2Recursive(bucket, prefix string, maxKe
 	return objects, nil
 }
 
-func (fs *FileSystemBackend) ListObjectsV2(bucket, prefix string, maxKeys int) ([]Object, error) {
+func (s *ltosServer) ListObjectsV2(bucket, prefix string, maxKeys int) ([]Object, error) {
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
 
-	bucketPath := filepath.Join(fs.dataDir, bucket)
+	bucketPath := filepath.Join(s.dataDir, bucket)
 	prefixPath := filepath.Join(bucketPath, prefix)
 
 	var objects []Object
@@ -1369,14 +1482,14 @@ func (fs *FileSystemBackend) ListObjectsV2(bucket, prefix string, maxKeys int) (
 
 	// If no objects found in the prefix directory, list the bucket root
 	if len(objects) == 0 && prefix != "" {
-		return fs.ListObjectsV2(bucket, "", maxKeys)
+		return s.ListObjectsV2(bucket, "", maxKeys)
 	}
 
 	return objects, nil
 }
 
-func (fs *FileSystemBackend) ListBucket(bucket string) ([]Object, error) {
-	bucketPath := filepath.Join(fs.dataDir, bucket)
+func (s *ltosServer) ListBucket(bucket string) ([]Object, error) {
+	bucketPath := filepath.Join(s.dataDir, bucket)
 
 	entries, err := ioutil.ReadDir(bucketPath)
 	if err != nil {
@@ -1492,8 +1605,7 @@ func extractMetadata(header http.Header) map[string]string {
 	}
 	return metadata
 }
-
-func (s *S3Server) replicateObject(sourceBucket, replicaBucket, object string, data io.Reader) error {
+func (s *ltosServer) replicateObjectFile(sourceBucket, replicaBucket, object string, data io.Reader) error {
 	content, err := ioutil.ReadAll(data)
 	if err != nil {
 		return fmt.Errorf("failed to read object data: %v", err)
@@ -1501,7 +1613,7 @@ func (s *S3Server) replicateObject(sourceBucket, replicaBucket, object string, d
 
 	metadata := make(map[string]string)
 
-	return s.storage.PutObject(replicaBucket, object, content, metadata)
+	return s.PutObject(replicaBucket, object, content, metadata, false)
 }
 
 func (rm *ReplicationManager) RemoveReplica(sourceBucket string) {
@@ -1510,34 +1622,38 @@ func (rm *ReplicationManager) RemoveReplica(sourceBucket string) {
 	delete(rm.replicas, sourceBucket)
 }
 
-func (s *S3Server) deleteBucket(bucket string) error {
-	return s.storage.DeleteBucket(bucket)
+func (s *ltosServer) deleteBucket(bucket string) error {
+	bucketPath := filepath.Join(s.dataDir, bucket)
+	err := s.DeleteBucket(bucketPath)
+	if err == nil {
+		bucketPath = filepath.Join(s.dataDirReplica, bucket)
+		err = s.DeleteBucket(bucket)
+	}
+	return err
 }
 
-func (fs *FileSystemBackend) DeleteBucket(bucket string) error {
-	bucketPath := filepath.Join(fs.dataDir, bucket)
-
+func (s *ltosServer) DeleteBucket(bucketPath string) error {
 	// Check if the bucket exists
 	if _, err := os.Stat(bucketPath); os.IsNotExist(err) {
-		return fmt.Errorf("bucket %s does not exist", bucket)
+		return fmt.Errorf("bucket %s does not exist", bucketPath)
 	}
 
 	// Remove the bucket directory and all its contents
 	err := os.RemoveAll(bucketPath)
 	if err != nil {
-		return fmt.Errorf("failed to delete bucket %s: %v", bucket, err)
+		return fmt.Errorf("failed to delete bucket %s: %v", bucketPath, err)
 	}
 
 	return nil
 }
 
-func (s *S3Server) handleBucketLocation(w http.ResponseWriter, r *http.Request) {
+func (s *ltosServer) handleBucketCmdsLocation(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
 
 	// Check if the bucket exists
 	// This is a placeholder - you'll need to implement actual bucket existence checking
-	if !s.storage.BucketExists(bucket) {
+	if !s.BucketExists(bucket) {
 		s.sendErrorResponse(w, "NoSuchBucket", http.StatusNotFound)
 		return
 	}
@@ -1563,8 +1679,95 @@ func (s *S3Server) handleBucketLocation(w http.ResponseWriter, r *http.Request) 
 	w.Write([]byte(xml.Header + string(xmlResponse)))
 }
 
-func (s *S3Server) getBucketLocation(bucket string) (string, error) {
+func (s *ltosServer) getBucketLocation(bucket string) (string, error) {
 	// This is a placeholder implementation
 	// In a real scenario, you would look up the bucket's location in your storage system
 	return "us-east-1", nil
+}
+
+func (s *ltosServer) createDirCtrFiles(bucket, objectKey string) error {
+	err := s.createDirCtrFile(s.dataDir, bucket, objectKey)
+	if err == nil {
+		err = s.createDirCtrFile(s.dataDirReplica, bucket, objectKey)
+	}
+	return err
+}
+
+func (s *ltosServer) createDirCtrFile(dataDir, bucket, objectKey string) error {
+	fullPath := filepath.Join(dataDir, bucket, objectKey)
+	os.MkdirAll(fullPath, 0755)
+
+	if strings.HasSuffix(objectKey, "/") {
+		objectKey = objectKey[0 : len(objectKey)-1]
+	}
+	base, dir := splitBaseDir(objectKey)
+
+	objectCtrl := base
+	if !strings.HasPrefix(objectCtrl, ".") {
+		objectCtrl = "." + objectCtrl
+	}
+	if strings.HasSuffix(objectCtrl, "/") {
+		objectCtrl = objectCtrl[0 : len(objectCtrl)-1]
+	}
+	objectCtrl = objectCtrl + ".metadata"
+	fullPath = filepath.Join(dataDir, bucket, dir, objectCtrl)
+
+	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+		metadata := map[string]string{
+			"CreatedAt": time.Now().UTC().Format(time.RFC3339),
+			"Path":      fullPath,
+		}
+		metadataJSON, err := json.Marshal(metadata)
+		if err != nil {
+			return fmt.Errorf("failed to marshal metadata: %v", err)
+		}
+		if err := ioutil.WriteFile(fullPath, metadataJSON, 0644); err != nil {
+			return fmt.Errorf("failed to write control file: %v", err)
+		}
+	}
+	return nil
+}
+
+func (s *ltosServer) createCtrFile(dataDir, bucket, objectKey string) error {
+	fullPath := filepath.Join(dataDir, bucket, objectKey)
+
+	if strings.HasSuffix(objectKey, "/") {
+		return nil
+	}
+
+	base, dir := splitBaseDir(objectKey)
+
+	objectCtrl := base
+	if !strings.HasPrefix(objectCtrl, ".") {
+		objectCtrl = "." + objectCtrl
+	}
+	if strings.HasSuffix(objectCtrl, "/") {
+		objectCtrl = objectCtrl[0 : len(objectCtrl)-1]
+	}
+	objectCtrl = objectCtrl + ".metadata"
+	fullPath = filepath.Join(dataDir, bucket, dir, objectCtrl)
+
+	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+		metadata := map[string]string{
+			"CreatedAt": time.Now().UTC().Format(time.RFC3339),
+			"Path":      fullPath,
+		}
+		metadataJSON, err := json.Marshal(metadata)
+		if err != nil {
+			return fmt.Errorf("failed to marshal metadata: %v", err)
+		}
+		if err := ioutil.WriteFile(fullPath, metadataJSON, 0644); err != nil {
+			return fmt.Errorf("failed to write control file: %v", err)
+		}
+	}
+	return nil
+}
+
+func splitBaseDir(path string) (string, string) {
+	lastIndex := strings.LastIndex(path, "/")
+	if lastIndex != -1 {
+		return path[lastIndex+1:], path[:lastIndex]
+	}
+
+	return path, ""
 }
