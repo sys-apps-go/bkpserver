@@ -248,7 +248,6 @@ func (s *S3Server) handleBucket(w http.ResponseWriter, r *http.Request) {
 			s.sendErrorResponse(w, "NoSuchBucket", http.StatusNotFound)
 			return
 		}
-
 		if prefix == "" {
 			objects, err = s.storage.ListBucket(bucketName)
 		} else if listType == 2 {
@@ -411,7 +410,6 @@ func (s *S3Server) handleObject(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	bucketName := vars["bucket"]
 	objectKey := vars["object"]
-
 	// Remove the leading slash if it exists
 	objectKey = strings.TrimPrefix(objectKey, "/")
 	switch r.Method {
@@ -581,10 +579,10 @@ func main() {
 			// Define routes
 
 			r.HandleFunc("/", s3server.handleRoot).Methods("GET")
+			r.HandleFunc("/{bucket}", s3server.handleBucket).Methods("GET", "PUT", "DELETE")
 			r.HandleFunc("/{bucket}/", s3server.handleBucketLocation).
 				Methods("GET").
 				Queries("location", "")
-			r.HandleFunc("/{bucket}/", s3server.handleBucket).Methods("GET", "PUT", "DELETE")
 
 			r.HandleFunc("/{bucket}/{object:.+}", s3server.handleNewMultipartUpload).
 				Methods("POST").
@@ -1333,7 +1331,6 @@ func (fs *FileSystemBackend) ListObjectsV2(bucket, prefix string, maxKeys int) (
 
 	var objects []Object
 	var count int
-
 	// Read the directory contents
 	entries, err := ioutil.ReadDir(prefixPath)
 	if err != nil {
@@ -1345,18 +1342,9 @@ func (fs *FileSystemBackend) ListObjectsV2(bucket, prefix string, maxKeys int) (
 
 	for _, entry := range entries {
 		relPath := entry.Name()
-		relPathSave := entry.Name()
-		if prefix != "" {
-			relPath = strings.TrimPrefix(relPath, prefix)
-			relPath = strings.TrimPrefix(relPath, "/")
-			ctrlFile := "." + relPath + ".metadata"
-			ctrlFilePath := filepath.Join(prefixPath, ctrlFile)
-			_, err := os.Stat(ctrlFilePath)
-			if err != nil {
-				continue
-			}
+		if strings.HasPrefix(relPath, ".") {
+			continue
 		}
-		relPath = filepath.Join(prefix, relPathSave)
 
 		object := Object{
 			Key:          relPath,
