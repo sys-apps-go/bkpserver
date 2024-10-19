@@ -186,6 +186,7 @@ func newLiteObjectStoreServer(primaryFs, replicaFs string) *ltosServer {
 		dataDirReplica:     replicaFs,
 		replicationManager: NewReplicationManager(),
 		controlFileMap:     make(map[string]bool),
+		bucketNames:        make(map[string]bool),
 	}
 	return s
 }
@@ -241,9 +242,9 @@ func (s *ltosServer) handleRoot(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-/* Do the following:
+/* Process the following commands:
  * Put: Create the bucket
- * Head: Get Bucket Status
+ * Head Get Bucket Status
  * Get: List all files and prefixes under bucket name
  * Delete: Delete the bucket
  */
@@ -251,6 +252,7 @@ func (s *ltosServer) handleRoot(w http.ResponseWriter, r *http.Request) {
 func (s *ltosServer) handleBucketCmds(w http.ResponseWriter, r *http.Request) {
 	var objects []Object
 	var err error
+
 	bucketName := mux.Vars(r)["bucket"]
 
 	queryParams := r.URL.Query()
@@ -261,6 +263,7 @@ func (s *ltosServer) handleBucketCmds(w http.ResponseWriter, r *http.Request) {
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
+
 	switch r.Method {
 	case "HEAD":
 		s.handleHeadCmdBucket(w, r, bucketName)
@@ -269,9 +272,8 @@ func (s *ltosServer) handleBucketCmds(w http.ResponseWriter, r *http.Request) {
 			s.sendErrorResponse(w, "NoSuchBucket", http.StatusNotFound)
 			return
 		}
-		if prefix == "" {
-			objects, err = s.ListObjectsV2(bucketName, prefix, maxKeys)
-		} else if listType == 2 {
+
+		if listType == 2 {
 			objects, err = s.ListObjectsV2(bucketName, prefix, maxKeys)
 		} else {
 			objects, err = s.ListObjects(bucketName)
@@ -383,11 +385,23 @@ func (s *ltosServer) handleBucketCmds(w http.ResponseWriter, r *http.Request) {
 			s.sendErrorResponse(w, "InvalidBucketName", http.StatusBadRequest)
 			return
 		}
+
+		s.mu.Lock()
+		_, exists := s.bucketNames[bucketName] 
+		if exists {
+			s.sendErrorResponse(w, "BucketAlreadyExists", http.StatusBadRequest)
+			s.mu.Unlock()
+			return
+		}
+		s.mu.Unlock()
+
+		// Create bucket
 		err := s.CreateBucket(bucketName)
 		if err != nil {
 			s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
 			return
 		}
+
 		// Create replica bucket
 		replicaBucket := bucketName
 		err = s.CreateBucketReplica(replicaBucket)
@@ -396,32 +410,21 @@ func (s *ltosServer) handleBucketCmds(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		s.mu.Lock()
+		s.bucketNames[bucketName]  = true
+		s.mu.Unlock()
+
 		// Add to replication manager
-		s.replicationManager.AddReplica(bucketName, replicaBucket)
 		w.WriteHeader(http.StatusOK)
 		w.Header().Set("Location", "/"+bucketName)
-	case "DELETE":
-		// Check if the bucket has a replica
-		replicaBucket, hasReplica := s.replicationManager.GetReplica(bucketName)
 
+	case "DELETE":
 		// Delete the original bucket
 		err := s.deleteBucket(bucketName)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Failed to delete bucket %s: %v", bucketName, err), http.StatusInternalServerError)
 			return
 		}
-
-		// If there's a replica, delete it too
-		if hasReplica {
-			err = s.deleteBucket(replicaBucket)
-			if err != nil {
-				log.Printf("Failed to delete replica bucket %s: %v", replicaBucket, err)
-				// Note: We don't return here because we've already deleted the main bucket
-			}
-			// Remove the replication mapping
-			s.replicationManager.RemoveReplica(bucketName)
-		}
-
 		w.WriteHeader(http.StatusNoContent)
 	}
 
@@ -441,8 +444,10 @@ func (s *ltosServer) handleObject(w http.ResponseWriter, r *http.Request) {
 	if strings.HasSuffix(objectKey, "/") {
 		isDir = true
 	}
+
 	// Remove the leading slash if it exists
 	objectKey = strings.TrimPrefix(objectKey, "/")
+
 	switch r.Method {
 	case "HEAD":
 		s.handleHeadObject(w, r, bucketName, objectKey)
@@ -651,7 +656,7 @@ func main() {
 
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		//log.Printf("Received request: %s %s", r.Method, r.URL)
+		log.Printf("Received request: %s %s", r.Method, r.URL)
 		next.ServeHTTP(w, r)
 	})
 }
@@ -1627,7 +1632,7 @@ func (s *ltosServer) deleteBucket(bucket string) error {
 	err := s.DeleteBucket(bucketPath)
 	if err == nil {
 		bucketPath = filepath.Join(s.dataDirReplica, bucket)
-		err = s.DeleteBucket(bucket)
+		err = s.DeleteBucket(bucketPath)
 	}
 	return err
 }
@@ -1635,13 +1640,17 @@ func (s *ltosServer) deleteBucket(bucket string) error {
 func (s *ltosServer) DeleteBucket(bucketPath string) error {
 	// Check if the bucket exists
 	if _, err := os.Stat(bucketPath); os.IsNotExist(err) {
-		return fmt.Errorf("bucket %s does not exist", bucketPath)
+		return nil
 	}
 
 	// Remove the bucket directory and all its contents
 	err := os.RemoveAll(bucketPath)
 	if err != nil {
 		return fmt.Errorf("failed to delete bucket %s: %v", bucketPath, err)
+	}
+
+	if _, err := os.Stat(bucketPath); os.IsNotExist(err) {
+		return fmt.Errorf("bucket %s does not exist", bucketPath)
 	}
 
 	return nil
