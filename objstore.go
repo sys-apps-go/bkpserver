@@ -268,6 +268,10 @@ func (s *ltosServer) handleBucketCmds(w http.ResponseWriter, r *http.Request) {
 	case "HEAD":
 		s.handleHeadCmdBucket(w, r, bucketName)
 	case "GET":
+		if maxKeys == 0 {
+			maxKeys = 1000 // Default value as per S3 API
+		}
+
 		if !s.BucketExists(bucketName) {
 			s.sendErrorResponse(w, "NoSuchBucket", http.StatusNotFound)
 			return
@@ -387,7 +391,7 @@ func (s *ltosServer) handleBucketCmds(w http.ResponseWriter, r *http.Request) {
 		}
 
 		s.mu.Lock()
-		_, exists := s.bucketNames[bucketName] 
+		_, exists := s.bucketNames[bucketName]
 		if exists {
 			s.sendErrorResponse(w, "BucketAlreadyExists", http.StatusBadRequest)
 			s.mu.Unlock()
@@ -411,7 +415,7 @@ func (s *ltosServer) handleBucketCmds(w http.ResponseWriter, r *http.Request) {
 		}
 
 		s.mu.Lock()
-		s.bucketNames[bucketName]  = true
+		s.bucketNames[bucketName] = true
 		s.mu.Unlock()
 
 		// Add to replication manager
@@ -1439,7 +1443,7 @@ func (s *ltosServer) ListObjectsV2Recursive(bucket, prefix string, maxKeys int) 
 	return objects, nil
 }
 
-func (s *ltosServer) ListObjectsV2(bucket, prefix string, maxKeys int) ([]Object, error) {
+func (s *ltosServer) ListObjectsV2Tmp(bucket, prefix string, maxKeys int) ([]Object, error) {
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
@@ -1779,4 +1783,65 @@ func splitBaseDir(path string) (string, string) {
 	}
 
 	return path, ""
+}
+
+func (s *ltosServer) ListObjectsV2(bucket, prefix string, maxKeys int) ([]Object, error) {
+	bucketPath := filepath.Join(s.dataDir, bucket)
+	prefixPath := filepath.Join(bucketPath, prefix)
+
+	var objects []Object
+	var count int
+
+	err := filepath.Walk(prefixPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		relPath, err := filepath.Rel(bucketPath, path)
+		if err != nil {
+			return err
+		}
+
+		relPath = filepath.ToSlash(relPath)
+
+		if !strings.HasPrefix(relPath, prefix) {
+			return nil
+		}
+
+		if isHidden(info.Name()) {
+			return nil
+		}
+
+		// Check for .metadata file
+		metadataPath := filepath.Join(filepath.Dir(path), "."+info.Name()+".metadata")
+		if _, err := os.Stat(metadataPath); os.IsNotExist(err) {
+			return nil
+		}
+
+		key := relPath
+		if info.IsDir() {
+			key += "/"
+		}
+
+		objects = append(objects, Object{
+			Key:          key,
+			LastModified: info.ModTime(),
+			ETag:         fmt.Sprintf("\"%x\"", md5.Sum([]byte(key))),
+			Size:         info.Size(),
+			IsDirectory:  info.IsDir(),
+		})
+
+		count++
+		if maxKeys != 0 && count >= maxKeys {
+			return filepath.SkipDir
+		}
+
+		return nil
+	})
+
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	return objects, nil
 }
