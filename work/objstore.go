@@ -99,6 +99,7 @@ type ltosServer struct {
 	bucketNames        map[string]bool
 	multipartUploads   sync.Map
 	replicationManager *ReplicationManager
+	controlFileMap     map[string]bool
 	mu                 sync.Mutex
 }
 
@@ -184,6 +185,7 @@ func newLiteObjectStoreServer(primaryFs, replicaFs string) *ltosServer {
 		dataDir:            primaryFs,
 		dataDirReplica:     replicaFs,
 		replicationManager: NewReplicationManager(),
+		controlFileMap:     make(map[string]bool),
 		bucketNames:        make(map[string]bool),
 	}
 	return s
@@ -276,7 +278,7 @@ func (s *ltosServer) handleBucketCmds(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if listType == 2 {
-			objects, err = s.ListObjectsV2(bucketName, prefix, maxKeys)
+			objects, err = s.ListObjectsV2Recursive(bucketName, prefix, maxKeys)
 		} else {
 			objects, err = s.ListObjects(bucketName)
 		}
@@ -432,7 +434,7 @@ func (s *ltosServer) handleBucketCmds(w http.ResponseWriter, r *http.Request) {
 
 }
 
-func (s *ltosServer) handleObject(w http.ResponseWriter, r *http.Request) {
+func (s *ltosServer) handleObjectCmds(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	bucketName := vars["bucket"]
 	objectKey := vars["object"]
@@ -449,7 +451,7 @@ func (s *ltosServer) handleObject(w http.ResponseWriter, r *http.Request) {
 
 	// Remove the leading slash if it exists
 	objectKey = strings.TrimPrefix(objectKey, "/")
-
+	
 	switch r.Method {
 	case "HEAD":
 		s.handleHeadObject(w, r, bucketName, objectKey)
@@ -493,7 +495,7 @@ func (s *ltosServer) handleObject(w http.ResponseWriter, r *http.Request) {
 		}
 	case "PUT":
 		if isDir {
-			s.createDirectoriesAll(bucketName, objectKey)
+			s.createDirectoryAndCotrolFiles(bucketName, objectKey)
 			return
 		}
 
@@ -514,14 +516,14 @@ func (s *ltosServer) handleObject(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Store the object and its metadata
-		err = s.PutObject(bucketName, objectKey, body, metadata)
+		err = s.PutObject(bucketName, objectKey, body, metadata, isDir)
 		if err != nil {
 			log.Printf("Error storing object: %v", err)
 			s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
 			return
 		}
 
-		err = s.replicateObject(bucketName, objectKey, body, metadata)
+		err = s.replicateObject(bucketName, objectKey, body)
 		if err != nil {
 			log.Printf("Failed to replicate object %s/%s: %v", bucketName, objectKey, err)
 			// Optionally handle the replication failure
@@ -621,10 +623,7 @@ func main() {
 
 			r.HandleFunc("/", ltosServer.handleRoot).Methods("GET")
 			r.HandleFunc("/{bucket}", ltosServer.handleBucketCmds).Methods("GET", "PUT", "DELETE")
-			r.HandleFunc("/{bucket}/", ltosServer.handleBucketCmdsLocation).
-				Methods("GET").
-				Queries("location", "")
-
+			r.HandleFunc("/{bucket}/{object:.+}", ltosServer.handleObjectCmds).Methods("GET", "PUT", "DELETE", "HEAD")
 			r.HandleFunc("/{bucket}/{object:.+}", ltosServer.handleNewMultipartUpload).
 				Methods("POST").
 				Queries("uploads", "")
@@ -634,7 +633,9 @@ func main() {
 			r.HandleFunc("/{bucket}/{object:.+}", ltosServer.handleCompleteMultipartUpload).
 				Methods("POST").
 				Queries("uploadId", "{uploadId}")
-			r.HandleFunc("/{bucket}/{object:.+}", ltosServer.handleObject).Methods("GET", "PUT", "DELETE", "HEAD")
+			r.HandleFunc("/{bucket}/", ltosServer.handleBucketCmdsLocation).
+				Methods("GET").
+				Queries("location", "")
 
 			r.PathPrefix("/").Handler(loggingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			})))
@@ -675,7 +676,7 @@ type StorageBackend interface {
 	BucketExists(name string) bool
 	BucketReplicaExists(name string) bool
 	GetObjectMetadata(bucket, key string, contentType string) (*ObjectMetadata, error)
-	PutObject(bucket string, obj string, data []byte, metadata map[string]string) error
+	PutObject(bucket string, obj string, data []byte, metadata map[string]string, sDir bool) error
 	InitiateMultipartUpload(bucket, key string) (string, error)
 	PutObjectPart(bucket, key, uploadID string, partNumber int, data []byte) error
 	CompleteMultipartUpload(bucket, key, uploadID string, parts []CompletedPart) error
@@ -820,19 +821,25 @@ func (s *ltosServer) GetObjectMetadata(bucket, key string, contentType string) (
 	return metadata, nil
 }
 
-func (s *ltosServer) PutObject(bucket, key string, data []byte, metadata map[string]string) error {
+func (s *ltosServer) PutObject(bucket, key string, data []byte, metadata map[string]string, isDir bool) error {
 	fullPath := filepath.Join(s.dataDir, bucket, key)
 
-	err := s.createDirectoriesAndControlFiles(s.dataDir, bucket, key)
+	// Ensure all parent directories exist and create control files for them
+	err := s.createDirectoriesAndControlFiles(s.dataDir, bucket, key, isDir)
+	if err != nil {
+		return err
+	}
+	err = s.createDirectoriesAndControlFiles(s.dataDirReplica, bucket, key, isDir)
 	if err != nil {
 		return err
 	}
 
-	err = s.createDirectoriesAndControlFiles(s.dataDirReplica, bucket, key)
-	if err != nil {
-		return err
+	// If the key ends with a slash, it's a directory
+	if strings.HasSuffix(key, "/") {
+		// The directory and its control file have already been created
+		return nil
 	}
-
+	// For regular files
 	// Write the file
 	if err := ioutil.WriteFile(fullPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write file: %v", err)
@@ -844,7 +851,6 @@ func (s *ltosServer) PutObject(bucket, key string, data []byte, metadata map[str
 	if err != nil {
 		return fmt.Errorf("failed to marshal metadata: %v", err)
 	}
-
 	if err := ioutil.WriteFile(metadataPath, metadataJSON, 0644); err != nil {
 		return fmt.Errorf("failed to write metadata: %v", err)
 	}
@@ -852,9 +858,21 @@ func (s *ltosServer) PutObject(bucket, key string, data []byte, metadata map[str
 	return nil
 }
 
-func (s *ltosServer) createDirectoriesAndControlFiles(dataDir, bucket, objectKey string) error {
-	fullPath := filepath.Join(dataDir, bucket, objectKey)
-	os.MkdirAll(filepath.Dir(fullPath), 0755)
+func (s *ltosServer) createDirectoriesAndControlFiles(dataDir, bucket, objectKey string, isDir bool) error {
+	fullPath := filepath.Join(s.dataDir, bucket, objectKey)
+	if isDir {
+		os.MkdirAll(fullPath, 0755)
+	} else {
+		os.MkdirAll(filepath.Dir(fullPath), 0755)
+	}
+
+	s.mu.Lock()
+	_, exists := s.controlFileMap[fullPath]
+	if exists {
+		s.mu.Unlock()
+		return nil
+	}
+	s.mu.Unlock()
 
 	if strings.HasSuffix(objectKey, "/") {
 		objectKey = objectKey[0 : len(objectKey)-1]
@@ -884,6 +902,9 @@ func (s *ltosServer) createDirectoriesAndControlFiles(dataDir, bucket, objectKey
 			return fmt.Errorf("failed to write control file: %v", err)
 		}
 	}
+	s.mu.Lock()
+	s.controlFileMap[fullPath] = true
+	s.mu.Unlock()
 	return nil
 }
 
@@ -1145,7 +1166,7 @@ func (s *ltosServer) CompleteMultipartUpload(bucket, key, uploadID string, parts
 	return nil
 }
 
-func (s *ltosServer) replicateObject(bucketName, key string, data []byte, metadata map[string]string) error {
+func (s *ltosServer) replicateObject(bucketName, key string, data []byte) error {
 	replicaPath := filepath.Join(s.dataDirReplica, bucketName, key)
 
 	// Ensure the directory structure exists
@@ -1359,16 +1380,14 @@ func (s *ltosServer) ListObjectsV2Recursive(bucket, prefix string, maxKeys int) 
 		relPath = filepath.ToSlash(relPath)
 		if prefix == "" || strings.HasPrefix(relPath, prefix) {
 			if info.IsDir() {
-				if relPath != prefix && relPath != "." {
-					objects = append(objects, Object{
-						Key:          relPath + "/",
-						LastModified: info.ModTime(),
-						ETag:         "",
-						Size:         0,
-						IsDirectory:  true,
-					})
-					count++
-				}
+				objects = append(objects, Object{
+					Key:          relPath + "/",
+					LastModified: info.ModTime(),
+					ETag:         "",
+					Size:         0,
+					IsDirectory:  true,
+				})
+				count++
 			} else {
 				objects = append(objects, Object{
 					Key:          relPath,
@@ -1392,37 +1411,10 @@ func (s *ltosServer) ListObjectsV2Recursive(bucket, prefix string, maxKeys int) 
 		return nil, err
 	}
 
-	if len(objects) == 0 {
-		files, err := os.ReadDir(bucketPath)
-		if err != nil {
-			return nil, err
-		}
-		for _, file := range files {
-			if strings.HasPrefix(file.Name(), prefix) {
-				relPath := filepath.ToSlash(file.Name())
-				info, err := file.Info()
-				if err != nil {
-					continue
-				}
-				objects = append(objects, Object{
-					Key:          relPath,
-					LastModified: info.ModTime(),
-					ETag:         fmt.Sprintf("\"%x\"", md5.Sum([]byte(relPath))), // Simple ETag for demo
-					Size:         info.Size(),
-					IsDirectory:  file.IsDir(),
-				})
-				count++
-				if count >= maxKeys {
-					break
-				}
-			}
-		}
-	}
-
 	return objects, nil
 }
 
-func (s *ltosServer) ListObjectsV2Tmp(bucket, prefix string, maxKeys int) ([]Object, error) {
+func (s *ltosServer) ListObjectsV2(bucket, prefix string, maxKeys int) ([]Object, error) {
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
@@ -1601,7 +1593,7 @@ func (s *ltosServer) replicateObjectFile(sourceBucket, replicaBucket, object str
 
 	metadata := make(map[string]string)
 
-	return s.PutObject(replicaBucket, object, content, metadata)
+	return s.PutObject(replicaBucket, object, content, metadata, false)
 }
 
 func (rm *ReplicationManager) RemoveReplica(sourceBucket string) {
@@ -1677,17 +1669,45 @@ func (s *ltosServer) getBucketLocation(bucket string) (string, error) {
 	return "us-east-1", nil
 }
 
-func (s *ltosServer) createDirectoriesAll(bucket, objectKey string) error {
-	fullPath := filepath.Join(s.dataDir, bucket, objectKey)
-	err := os.MkdirAll(fullPath, 0755)
-	if err != nil {
-		return err
+func (s *ltosServer) createDirectoryAndCotrolFilesTmp(bucket, objectKey string) error {
+	err := s.createDirectoryAndControlFile(s.dataDir, bucket, objectKey)
+	if err == nil {
+		err = s.createDirectoryAndControlFile(s.dataDirReplica, bucket, objectKey)
 	}
+	return err
+}
 
-	fullPath = filepath.Join(s.dataDirReplica, bucket, objectKey)
-	err = os.MkdirAll(fullPath, 0755)
-	if err != nil {
-		return err
+func (s *ltosServer) createDirectoryAndControlFileTmp(dataDir, bucket, objectKey string) error {
+	fullPath := filepath.Join(dataDir, bucket, objectKey)
+	os.MkdirAll(fullPath, 0755)
+
+	if strings.HasSuffix(objectKey, "/") {
+		objectKey = objectKey[0 : len(objectKey)-1]
+	}
+	base, dir := splitBaseDir(objectKey)
+
+	objectCtrl := base
+	if !strings.HasPrefix(objectCtrl, ".") {
+		objectCtrl = "." + objectCtrl
+	}
+	if strings.HasSuffix(objectCtrl, "/") {
+		objectCtrl = objectCtrl[0 : len(objectCtrl)-1]
+	}
+	objectCtrl = objectCtrl + ".metadata"
+	fullPath = filepath.Join(dataDir, bucket, dir, objectCtrl)
+
+	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+		metadata := map[string]string{
+			"CreatedAt": time.Now().UTC().Format(time.RFC3339),
+			"Path":      fullPath,
+		}
+		metadataJSON, err := json.Marshal(metadata)
+		if err != nil {
+			return fmt.Errorf("failed to marshal metadata: %v", err)
+		}
+		if err := ioutil.WriteFile(fullPath, metadataJSON, 0644); err != nil {
+			return fmt.Errorf("failed to write control file: %v", err)
+		}
 	}
 	return nil
 }
@@ -1736,7 +1756,7 @@ func splitBaseDir(path string) (string, string) {
 	return path, ""
 }
 
-func (s *ltosServer) ListObjectsV2(bucket, prefix string, maxKeys int) ([]Object, error) {
+func (s *ltosServer) ListObjectsV2RecursiveTmp(bucket, prefix string, maxKeys int) ([]Object, error) {
 	bucketPath := filepath.Join(s.dataDir, bucket)
 	prefixPath := filepath.Join(bucketPath, prefix)
 
@@ -1769,6 +1789,7 @@ func (s *ltosServer) ListObjectsV2(bucket, prefix string, maxKeys int) ([]Object
 			return nil
 		}
 
+		relPath, _ = filepath.Rel(bucketPath, path)
 		key := relPath
 		if info.IsDir() {
 			key += "/"
@@ -1795,4 +1816,68 @@ func (s *ltosServer) ListObjectsV2(bucket, prefix string, maxKeys int) ([]Object
 	}
 
 	return objects, nil
+}
+
+func (s *ltosServer) createDirectoryAndCotrolFiles(bucket, objectKey string) error {
+	var wg sync.WaitGroup
+	errChan := make(chan error, 2)
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if err := s.createDirectoryAndControlFile(s.dataDir, bucket, objectKey); err != nil {
+			errChan <- fmt.Errorf("main dir: %v", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if err := s.createDirectoryAndControlFile(s.dataDirReplica, bucket, objectKey); err != nil {
+			errChan <- fmt.Errorf("replica dir: %v", err)
+		}
+	}()
+
+	wg.Wait()
+	close(errChan)
+
+	for err := range errChan {
+		return err // Return the first error encountered
+	}
+
+	return nil
+}
+
+func (s *ltosServer) createDirectoryAndControlFile(dataDir, bucket, objectKey string) error {
+	fullPath := filepath.Join(dataDir, bucket, objectKey)
+	os.MkdirAll(fullPath, 0755)
+
+	if strings.HasSuffix(objectKey, "/") {
+		objectKey = objectKey[0 : len(objectKey)-1]
+	}
+	base, dir := splitBaseDir(objectKey)
+
+	objectCtrl := base
+	if !strings.HasPrefix(objectCtrl, ".") {
+		objectCtrl = "." + objectCtrl
+	}
+	if strings.HasSuffix(objectCtrl, "/") {
+		objectCtrl = objectCtrl[0 : len(objectCtrl)-1]
+	}
+	objectCtrl = objectCtrl + ".metadata"
+	fullPath = filepath.Join(dataDir, bucket, dir, objectCtrl)
+
+	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+		metadata := map[string]string{
+			"CreatedAt": time.Now().UTC().Format(time.RFC3339),
+			"Path":      fullPath,
+		}
+		metadataJSON, err := json.Marshal(metadata)
+		if err != nil {
+			return fmt.Errorf("failed to marshal metadata: %v", err)
+		}
+		if err := ioutil.WriteFile(fullPath, metadataJSON, 0644); err != nil {
+			return fmt.Errorf("failed to write control file: %v", err)
+		}
+		log.Printf("Created metadata file: %s", fullPath)
+	}
+	return nil
 }

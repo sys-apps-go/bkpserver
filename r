@@ -1,0 +1,2 @@
+~/crfs
+go run *go
