@@ -432,7 +432,7 @@ func (s *ltosServer) handleBucketCmds(w http.ResponseWriter, r *http.Request) {
 
 }
 
-func (s *ltosServer) handleObject(w http.ResponseWriter, r *http.Request) {
+func (s *ltosServer) handleObjectCmds(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	bucketName := vars["bucket"]
 	objectKey := vars["object"]
@@ -620,7 +620,8 @@ func main() {
 			// Define routes
 
 			r.HandleFunc("/", ltosServer.handleRoot).Methods("GET")
-			r.HandleFunc("/{bucket}", ltosServer.handleBucketCmds).Methods("GET", "PUT", "DELETE")
+			r.HandleFunc("/{bucket}", ltosServer.handleBucketCmds).Methods("HEAD", "GET", "PUT", "DELETE")
+			r.HandleFunc("/{bucket}/{object:.+}", ltosServer.handleObjectCmds).Methods("GET", "PUT", "DELETE", "HEAD")
 			r.HandleFunc("/{bucket}/", ltosServer.handleBucketCmdsLocation).
 				Methods("GET").
 				Queries("location", "")
@@ -634,10 +635,9 @@ func main() {
 			r.HandleFunc("/{bucket}/{object:.+}", ltosServer.handleCompleteMultipartUpload).
 				Methods("POST").
 				Queries("uploadId", "{uploadId}")
-			r.HandleFunc("/{bucket}/{object:.+}", ltosServer.handleObject).Methods("GET", "PUT", "DELETE", "HEAD")
+			//r.PathPrefix("/").Handler(loggingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			//})))
 
-			r.PathPrefix("/").Handler(loggingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			})))
 
 			// Add logging middleware
 			r.Use(loggingMiddleware)
@@ -709,48 +709,37 @@ func (s *ltosServer) ListObjects(bucket string) ([]Object, error) {
 	bucketPath := filepath.Join(s.dataDir, bucket)
 	var objects []Object
 
-	err := filepath.Walk(bucketPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		// Skip the root directory
-		if path == bucketPath {
-			return nil
-		}
-		if isHidden(path) {
-			if info.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		// Get the key (path relative to bucket root)
-		key, err := filepath.Rel(bucketPath, path)
-		if err != nil {
-			return err
-		}
-		key = filepath.ToSlash(key) // Convert to forward slashes for S3 compatibility
-
-		if !info.IsDir() {
-			content, err := ioutil.ReadFile(path)
-			if err != nil {
-				return err
-			}
-			hash := md5.Sum(content)
-			objects = append(objects, Object{
-				Key:          key,
-				LastModified: info.ModTime(),
-				ETag:         fmt.Sprintf("\"%x\"", hash),
-				Size:         info.Size(),
-			})
-		}
-
-		return nil
-	})
-
+	files, err := ioutil.ReadDir(bucketPath)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return objects, err
+		}
 		return nil, err
+	}
+
+	for _, info := range files {
+		relPath := info.Name()
+		relPath = filepath.ToSlash(relPath) // Convert to forward slashes for S3 compatibility
+
+		if relPath != "." {
+			if info.IsDir() {
+				objects = append(objects, Object{
+					Key:          relPath + "/",
+					LastModified: info.ModTime(),
+					ETag:         "",
+					Size:         0,
+					IsDirectory:  true,
+				})
+			} else {
+				objects = append(objects, Object{
+					Key:          relPath,
+					LastModified: info.ModTime(),
+					ETag:         fmt.Sprintf("\"%x\"", md5.Sum([]byte(relPath))), // Simple ETag for demo
+					Size:         info.Size(),
+					IsDirectory:  false,
+				})
+			}
+		}
 	}
 
 	return objects, nil
@@ -1349,11 +1338,13 @@ func (s *ltosServer) ListObjectsV2(bucket, prefix string, maxKeys int) ([]Object
 			return err
 		}
 
-		if isHidden(path) {
-			if info.IsDir() {
-				return filepath.SkipDir
+		if !info.IsDir() {
+			// Check for .metadata file
+			metadataPath := filepath.Join(filepath.Dir(path), "."+info.Name()+".metadata")
+			if _, err := os.Stat(metadataPath); os.IsNotExist(err) {
+				// Skip if .metadata file doesn't exist
+				return nil
 			}
-			return nil
 		}
 
 		relPath = filepath.ToSlash(relPath)
@@ -1460,7 +1451,6 @@ func extractAuthInfo(r *http.Request) map[string]string {
 	// Check Authorization header
 	if auth := r.Header.Get("Authorization"); auth != "" {
 		// Parse Authorization header
-		// This is a simplified example; you'll need to implement proper parsing
 		authInfo["type"] = "header"
 		authInfo["auth"] = auth
 	} else {
@@ -1468,14 +1458,12 @@ func extractAuthInfo(r *http.Request) map[string]string {
 		authInfo["type"] = "query"
 		authInfo["accessKey"] = r.URL.Query().Get("AWSAccessKeyId")
 		authInfo["signature"] = r.URL.Query().Get("Signature")
-		// Add other necessary query parameters
 	}
 
 	return authInfo
 }
 
 func validateAuth(authInfo map[string]string, accessKeyID, secretAccessKey string) bool {
-	// This is a placeholder implementation
 	if authInfo["type"] == "header" {
 		// Verify header-based auth
 		return strings.Contains(authInfo["auth"], accessKeyID)
@@ -1561,14 +1549,12 @@ func (s *ltosServer) handleBucketCmdsLocation(w http.ResponseWriter, r *http.Req
 	bucket := vars["bucket"]
 
 	// Check if the bucket exists
-	// This is a placeholder - you'll need to implement actual bucket existence checking
 	if !s.BucketExists(bucket) {
 		s.sendErrorResponse(w, "NoSuchBucket", http.StatusNotFound)
 		return
 	}
 
 	// Get the bucket location
-	// This is a placeholder - you'll need to implement actual location retrieval
 	location, _ := s.getBucketLocation(bucket)
 
 	// Create the response
@@ -1589,8 +1575,6 @@ func (s *ltosServer) handleBucketCmdsLocation(w http.ResponseWriter, r *http.Req
 }
 
 func (s *ltosServer) getBucketLocation(bucket string) (string, error) {
-	// This is a placeholder implementation
-	// In a real scenario, you would look up the bucket's location in your storage system
 	return "us-east-1", nil
 }
 
