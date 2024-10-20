@@ -259,7 +259,7 @@ func (s *ltosServer) handleBucketCmds(w http.ResponseWriter, r *http.Request) {
 	maxKeys, _ := strconv.Atoi(queryParams.Get("max-keys"))
 
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
-		prefix += "/"
+		prefix = prefix + "/"
 	}
 
 	switch r.Method {
@@ -1325,7 +1325,7 @@ func isHidden(path string) bool {
 	return false
 }
 
-func (s *ltosServer) ListObjectsV2Recursive(bucket, prefix string, maxKeys int) ([]Object, error) {
+func (s *ltosServer) ListObjectsV2(bucket, prefix string, maxKeys int) ([]Object, error) {
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
@@ -1390,33 +1390,6 @@ func (s *ltosServer) ListObjectsV2Recursive(bucket, prefix string, maxKeys int) 
 
 	if err != nil {
 		return nil, err
-	}
-
-	if len(objects) == 0 {
-		files, err := os.ReadDir(bucketPath)
-		if err != nil {
-			return nil, err
-		}
-		for _, file := range files {
-			if strings.HasPrefix(file.Name(), prefix) {
-				relPath := filepath.ToSlash(file.Name())
-				info, err := file.Info()
-				if err != nil {
-					continue
-				}
-				objects = append(objects, Object{
-					Key:          relPath,
-					LastModified: info.ModTime(),
-					ETag:         fmt.Sprintf("\"%x\"", md5.Sum([]byte(relPath))), // Simple ETag for demo
-					Size:         info.Size(),
-					IsDirectory:  file.IsDir(),
-				})
-				count++
-				if count >= maxKeys {
-					break
-				}
-			}
-		}
 	}
 
 	return objects, nil
@@ -1736,7 +1709,7 @@ func splitBaseDir(path string) (string, string) {
 	return path, ""
 }
 
-func (s *ltosServer) ListObjectsV2(bucket, prefix string, maxKeys int) ([]Object, error) {
+func (s *ltosServer) ListObjectsV2Recursive(bucket, prefix string, maxKeys int) ([]Object, error) {
 	bucketPath := filepath.Join(s.dataDir, bucket)
 	prefixPath := filepath.Join(bucketPath, prefix)
 
@@ -1748,25 +1721,26 @@ func (s *ltosServer) ListObjectsV2(bucket, prefix string, maxKeys int) ([]Object
 			return err
 		}
 
+		if isHidden(path) {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
 		relPath, err := filepath.Rel(bucketPath, path)
 		if err != nil {
 			return err
 		}
 
-		relPath = filepath.ToSlash(relPath)
-
-		if !strings.HasPrefix(relPath, prefix) {
-			return nil
-		}
-
-		if isHidden(info.Name()) {
-			return nil
-		}
+		relPath = filepath.ToSlash(relPath)  
 
 		// Check for .metadata file
-		metadataPath := filepath.Join(filepath.Dir(path), "."+info.Name()+".metadata")
-		if _, err := os.Stat(metadataPath); os.IsNotExist(err) {
-			return nil
+		if !info.IsDir() {  // Regular files other than directories will have .<filesname>.metadata file
+			metadataPath := filepath.Join(filepath.Dir(path), "."+info.Name()+".metadata")
+			if _, err := os.Stat(metadataPath); os.IsNotExist(err) {
+				return nil
+			}
 		}
 
 		key := relPath
@@ -1781,6 +1755,7 @@ func (s *ltosServer) ListObjectsV2(bucket, prefix string, maxKeys int) ([]Object
 			Size:         info.Size(),
 			IsDirectory:  info.IsDir(),
 		})
+		fmt.Println(key)
 
 		count++
 		if maxKeys != 0 && count >= maxKeys {
