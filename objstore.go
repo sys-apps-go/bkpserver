@@ -1357,18 +1357,16 @@ func (s *ltosServer) ListObjectsV2(bucket, prefix string, maxKeys int) ([]Object
 		}
 
 		relPath = filepath.ToSlash(relPath)
-		if prefix == "" || strings.HasPrefix(relPath, prefix) {
+		if relPath != "." {
 			if info.IsDir() {
-				if relPath != prefix && relPath != "." {
-					objects = append(objects, Object{
-						Key:          relPath + "/",
-						LastModified: info.ModTime(),
-						ETag:         "",
-						Size:         0,
-						IsDirectory:  true,
-					})
-					count++
-				}
+				objects = append(objects, Object{
+					Key:          relPath + "/",
+					LastModified: info.ModTime(),
+					ETag:         "",
+					Size:         0,
+					IsDirectory:  true,
+				})
+				count++
 			} else {
 				objects = append(objects, Object{
 					Key:          relPath,
@@ -1390,60 +1388,6 @@ func (s *ltosServer) ListObjectsV2(bucket, prefix string, maxKeys int) ([]Object
 
 	if err != nil {
 		return nil, err
-	}
-
-	return objects, nil
-}
-
-func (s *ltosServer) ListObjectsV2Tmp(bucket, prefix string, maxKeys int) ([]Object, error) {
-	if prefix != "" && !strings.HasSuffix(prefix, "/") {
-		prefix += "/"
-	}
-
-	bucketPath := filepath.Join(s.dataDir, bucket)
-	prefixPath := filepath.Join(bucketPath, prefix)
-
-	var objects []Object
-	var count int
-	// Read the directory contents
-	entries, err := ioutil.ReadDir(prefixPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil // Return empty list if directory doesn't exist
-		}
-		return nil, err
-	}
-
-	for _, entry := range entries {
-		relPath := entry.Name()
-		if strings.HasPrefix(relPath, ".") && strings.HasSuffix(relPath, ".metadata") {
-			continue
-		}
-
-		object := Object{
-			Key:          relPath,
-			LastModified: entry.ModTime(),
-			ETag:         fmt.Sprintf("\"%x\"", md5.Sum([]byte(relPath))), // Simple ETag for demo
-			Size:         entry.Size(),
-			IsDirectory:  entry.IsDir(),
-		}
-
-		if entry.IsDir() {
-			object.Key = object.Key + "/"
-			object.Size = 0
-		}
-
-		objects = append(objects, object)
-		count++
-
-		if maxKeys != 0 && count >= maxKeys {
-			break
-		}
-	}
-
-	// If no objects found in the prefix directory, list the bucket root
-	if len(objects) == 0 && prefix != "" {
-		return s.ListObjectsV2(bucket, "", maxKeys)
 	}
 
 	return objects, nil
@@ -1707,67 +1651,4 @@ func splitBaseDir(path string) (string, string) {
 	}
 
 	return path, ""
-}
-
-func (s *ltosServer) ListObjectsV2Recursive(bucket, prefix string, maxKeys int) ([]Object, error) {
-	bucketPath := filepath.Join(s.dataDir, bucket)
-	prefixPath := filepath.Join(bucketPath, prefix)
-
-	var objects []Object
-	var count int
-
-	err := filepath.Walk(prefixPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if isHidden(path) {
-			if info.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		relPath, err := filepath.Rel(bucketPath, path)
-		if err != nil {
-			return err
-		}
-
-		relPath = filepath.ToSlash(relPath)  
-
-		// Check for .metadata file
-		if !info.IsDir() {  // Regular files other than directories will have .<filesname>.metadata file
-			metadataPath := filepath.Join(filepath.Dir(path), "."+info.Name()+".metadata")
-			if _, err := os.Stat(metadataPath); os.IsNotExist(err) {
-				return nil
-			}
-		}
-
-		key := relPath
-		if info.IsDir() {
-			key += "/"
-		}
-
-		objects = append(objects, Object{
-			Key:          key,
-			LastModified: info.ModTime(),
-			ETag:         fmt.Sprintf("\"%x\"", md5.Sum([]byte(key))),
-			Size:         info.Size(),
-			IsDirectory:  info.IsDir(),
-		})
-		fmt.Println(key)
-
-		count++
-		if maxKeys != 0 && count >= maxKeys {
-			return filepath.SkipDir
-		}
-
-		return nil
-	})
-
-	if err != nil && !os.IsNotExist(err) {
-		return nil, err
-	}
-
-	return objects, nil
 }
