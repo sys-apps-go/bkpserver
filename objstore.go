@@ -620,11 +620,12 @@ func main() {
 			// Define routes
 
 			r.HandleFunc("/", ltosServer.handleRoot).Methods("GET")
-			r.HandleFunc("/{bucket}", ltosServer.handleBucketCmds).Methods("HEAD", "GET", "PUT", "DELETE")
-			r.HandleFunc("/{bucket}/{object:.+}", ltosServer.handleObjectCmds).Methods("GET", "PUT", "DELETE", "HEAD")
 			r.HandleFunc("/{bucket}/", ltosServer.handleBucketCmdsLocation).
 				Methods("GET").
 				Queries("location", "")
+			r.HandleFunc("/{bucket}", ltosServer.handleBucketCmds).Methods("HEAD", "GET", "PUT", "DELETE")
+			r.HandleFunc("/{bucket}/", ltosServer.handleBucketCmds).Methods("HEAD", "GET", "PUT", "DELETE")
+			r.HandleFunc("/{bucket}/{object:.+}", ltosServer.handleObjectCmds).Methods("GET", "PUT", "DELETE", "HEAD")
 
 			r.HandleFunc("/{bucket}/{object:.+}", ltosServer.handleNewMultipartUpload).
 				Methods("POST").
@@ -635,8 +636,6 @@ func main() {
 			r.HandleFunc("/{bucket}/{object:.+}", ltosServer.handleCompleteMultipartUpload).
 				Methods("POST").
 				Queries("uploadId", "{uploadId}")
-			//r.PathPrefix("/").Handler(loggingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			//})))
 
 
 			// Add logging middleware
