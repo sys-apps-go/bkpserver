@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
+	"github.com/google/uuid"
 	"io"
 	"io/ioutil"
 	"log"
@@ -55,6 +58,33 @@ type ObjectInfo struct {
 	Metadata     map[string]string
 }
 
+type APIError struct {
+	Code           string
+	Description    string
+	HTTPStatusCode int
+}
+type BucketACL struct {
+	Owner       Owner        `xml:"Owner"`
+	AccessRules []AccessRule `xml:"AccessControlList>Grant"`
+}
+
+type Owner struct {
+	ID          string `xml:"ID"`
+	DisplayName string `xml:"DisplayName"`
+}
+
+type AccessRule struct {
+	Grantee    Grantee `xml:"Grantee"`
+	Permission string  `xml:"Permission"`
+}
+
+type Grantee struct {
+	ID          string `xml:"ID,omitempty"`
+	DisplayName string `xml:"DisplayName,omitempty"`
+	URI         string `xml:"URI,omitempty"`
+	Type        string `xml:"type,attr"`
+}
+
 type CompleteMultipartUpload struct {
 	XMLName xml.Name        `xml:"CompleteMultipartUpload"`
 	Parts   []CompletedPart `xml:"Part"`
@@ -86,12 +116,21 @@ type LocationResponse struct {
 	Location string   `xml:",chardata"`
 }
 
+type ErrorResponse struct {
+	XMLName    xml.Name `xml:"Error"`
+	Code       string   `xml:"Code"`
+	Message    string   `xml:"Message"`
+	BucketName string   `xml:"BucketName"`
+	RequestID  string   `xml:"RequestId"`
+	HostID     string   `xml:"HostId"`
+}
+
 type Bucket struct {
 	Name         string
 	CreationDate time.Time
 }
 
-type ltosServer struct {
+type objStoreServer struct {
 	storage            StorageBackend
 	dataDir            string
 	dataDirReplica     string
@@ -150,37 +189,37 @@ func newFileSystemBackend(dataDir string) error {
 	return nil
 }
 
-func (s *ltosServer) CreateBucket(name string) error {
+func (s *objStoreServer) CreateBucket(name string) error {
 	if s.BucketExists(name) {
 		return nil
 	}
 	return os.Mkdir(filepath.Join(s.dataDir, name), 0755)
 }
 
-func (s *ltosServer) CreateBucketReplica(name string) error {
+func (s *objStoreServer) CreateBucketReplica(name string) error {
 	if s.BucketExistsReplica(name) {
 		return nil
 	}
 	return os.Mkdir(filepath.Join(s.dataDirReplica, name), 0755)
 }
 
-func (s *ltosServer) GetObject(bucket, key string) ([]byte, error) {
+func (s *objStoreServer) GetObject(bucket, key string) ([]byte, error) {
 	path := filepath.Join(s.dataDir, bucket, key)
 	return ioutil.ReadFile(path)
 }
 
-func (s *ltosServer) DeleteObject(bucket, key string) error {
+func (s *objStoreServer) DeleteObject(bucket, key string) error {
 	path := filepath.Join(s.dataDir, bucket, key)
 	return os.RemoveAll(path)
 }
 
-func newLiteObjectStoreServer(primaryFs, replicaFs string) *ltosServer {
+func newLiteObjectStoreServer(primaryFs, replicaFs string) *objStoreServer {
 	err := createFileSystemBackend(primaryFs, replicaFs)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
-	s := &ltosServer{
+	s := &objStoreServer{
 		dataDir:            primaryFs,
 		dataDirReplica:     replicaFs,
 		replicationManager: NewReplicationManager(),
@@ -189,7 +228,7 @@ func newLiteObjectStoreServer(primaryFs, replicaFs string) *ltosServer {
 	return s
 }
 
-func (s *ltosServer) handleRoot(w http.ResponseWriter, r *http.Request) {
+func (s *objStoreServer) handleRoot(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/xml")
 
 	buckets, err := s.ListBuckets()
@@ -218,7 +257,7 @@ func (s *ltosServer) handleRoot(w http.ResponseWriter, r *http.Request) {
 			DisplayName string `xml:"DisplayName"`
 		}{
 			ID:          "123456789",
-			DisplayName: "ltosServerOwner",
+			DisplayName: "objStoreServerOwner",
 		},
 	}
 
@@ -247,7 +286,7 @@ func (s *ltosServer) handleRoot(w http.ResponseWriter, r *http.Request) {
  * Delete: Delete the bucket
  */
 
-func (s *ltosServer) handleBucketCmds(w http.ResponseWriter, r *http.Request) {
+func (s *objStoreServer) handleBucketCmds(w http.ResponseWriter, r *http.Request) {
 	var objects []Object
 	var err error
 
@@ -388,6 +427,12 @@ func (s *ltosServer) handleBucketCmds(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Check if this is an ACL operation
+		if r.URL.Query().Get("acl") != "" {
+			s.PutBucketACLHandler(w, r)
+			return
+		}
+
 		s.mu.Lock()
 		_, exists := s.bucketNames[bucketName]
 		if exists {
@@ -432,7 +477,7 @@ func (s *ltosServer) handleBucketCmds(w http.ResponseWriter, r *http.Request) {
 
 }
 
-func (s *ltosServer) handleObjectCmds(w http.ResponseWriter, r *http.Request) {
+func (s *objStoreServer) handleObjectCmds(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	bucketName := vars["bucket"]
 	objectKey := vars["object"]
@@ -610,7 +655,7 @@ func main() {
 				port = "50051" // Default port if none specified
 			}
 
-			ltosServer := newLiteObjectStoreServer(filesystemDrive, filesystemReplicaDrive)
+			objStoreServer := newLiteObjectStoreServer(filesystemDrive, filesystemReplicaDrive)
 
 			r := mux.NewRouter()
 
@@ -619,24 +664,24 @@ func main() {
 
 			// Define routes
 
-			r.HandleFunc("/", ltosServer.handleRoot).Methods("GET")
-			r.HandleFunc("/{bucket}/", ltosServer.handleBucketCmdsLocation).
+			r.HandleFunc("/", objStoreServer.handleRoot).Methods("GET")
+			r.HandleFunc("/{bucket}/", objStoreServer.handleBucketCmdsLocation).
 				Methods("GET").
 				Queries("location", "")
-			r.HandleFunc("/{bucket}", ltosServer.handleBucketCmds).Methods("HEAD", "GET", "PUT", "DELETE")
-			r.HandleFunc("/{bucket}/", ltosServer.handleBucketCmds).Methods("HEAD", "GET", "PUT", "DELETE")
-			r.HandleFunc("/{bucket}/{object:.+}", ltosServer.handleObjectCmds).Methods("GET", "PUT", "DELETE", "HEAD")
+			r.HandleFunc("/{bucket}", objStoreServer.handleBucketCmds).Methods("HEAD", "GET", "PUT", "DELETE")
+			r.HandleFunc("/{bucket}/", objStoreServer.handleBucketCmds).Methods("HEAD", "GET", "PUT", "DELETE")
+			r.HandleFunc("/{bucket}/{object:.+}", objStoreServer.handleObjectCmds).Methods("GET", "PUT", "DELETE", "HEAD")
 
-			r.HandleFunc("/{bucket}/{object:.+}", ltosServer.handleNewMultipartUpload).
+			r.HandleFunc("/{bucket}/{object:.+}", objStoreServer.handleNewMultipartUpload).
 				Methods("POST").
 				Queries("uploads", "")
-			r.HandleFunc("/{bucket}/{object:.+}", ltosServer.handleUploadPart).
+			r.HandleFunc("/{bucket}/{object:.+}", objStoreServer.handleUploadPart).
 				Methods("PUT").
 				Queries("partNumber", "{partNumber:[0-9]+}", "uploadId", "{uploadId}")
-			r.HandleFunc("/{bucket}/{object:.+}", ltosServer.handleCompleteMultipartUpload).
+			r.HandleFunc("/{bucket}/{object:.+}", objStoreServer.handleCompleteMultipartUpload).
 				Methods("POST").
 				Queries("uploadId", "{uploadId}")
-
+			r.HandleFunc("/{bucket}/acl", objStoreServer.BucketACLHandler).Methods("GET", "PUT")
 
 			// Add logging middleware
 			r.Use(loggingMiddleware)
@@ -682,7 +727,7 @@ type StorageBackend interface {
 	ListObjectsV2(bucket, prefix string, maxKeys int) ([]Object, error)
 }
 
-func (s *ltosServer) IsPrefix(bucket, prefix string) (bool, error) {
+func (s *objStoreServer) IsPrefix(bucket, prefix string) (bool, error) {
 	dirPath := filepath.Join(s.dataDir, bucket, prefix)
 	files, err := ioutil.ReadDir(dirPath)
 	if err != nil {
@@ -694,17 +739,17 @@ func (s *ltosServer) IsPrefix(bucket, prefix string) (bool, error) {
 	return len(files) > 0, nil
 }
 
-func (s *ltosServer) BucketExists(name string) bool {
+func (s *objStoreServer) BucketExists(name string) bool {
 	_, err := os.Stat(filepath.Join(s.dataDir, name))
 	return !os.IsNotExist(err)
 }
 
-func (s *ltosServer) BucketExistsReplica(name string) bool {
+func (s *objStoreServer) BucketExistsReplica(name string) bool {
 	_, err := os.Stat(filepath.Join(s.dataDirReplica, name))
 	return !os.IsNotExist(err)
 }
 
-func (s *ltosServer) ListObjects(bucket string) ([]Object, error) {
+func (s *objStoreServer) ListObjects(bucket string) ([]Object, error) {
 	bucketPath := filepath.Join(s.dataDir, bucket)
 	var objects []Object
 
@@ -744,7 +789,7 @@ func (s *ltosServer) ListObjects(bucket string) ([]Object, error) {
 	return objects, nil
 }
 
-func (s *ltosServer) ListBuckets() ([]Bucket, error) {
+func (s *objStoreServer) ListBuckets() ([]Bucket, error) {
 	files, err := ioutil.ReadDir(s.dataDir)
 	if err != nil {
 		return nil, err
@@ -762,7 +807,7 @@ func (s *ltosServer) ListBuckets() ([]Bucket, error) {
 	return buckets, nil
 }
 
-func (s *ltosServer) sendErrorResponse(w http.ResponseWriter, code string, status int) {
+func (s *objStoreServer) sendErrorResponse(w http.ResponseWriter, code string, status int) {
 	w.WriteHeader(status)
 	w.Header().Set("Content-Type", "application/xml")
 
@@ -782,7 +827,7 @@ func (s *ltosServer) sendErrorResponse(w http.ResponseWriter, code string, statu
 	}
 }
 
-func (s *ltosServer) GetObjectMetadata(bucket, key string, contentType string) (*ObjectMetadata, error) {
+func (s *objStoreServer) GetObjectMetadata(bucket, key string, contentType string) (*ObjectMetadata, error) {
 	path := filepath.Join(s.dataDir, bucket, key)
 	info, err := os.Stat(path)
 	if err != nil {
@@ -808,7 +853,7 @@ func (s *ltosServer) GetObjectMetadata(bucket, key string, contentType string) (
 	return metadata, nil
 }
 
-func (s *ltosServer) PutObject(bucket, key string, data []byte, metadata map[string]string) error {
+func (s *objStoreServer) PutObject(bucket, key string, data []byte, metadata map[string]string) error {
 	fullPath := filepath.Join(s.dataDir, bucket, key)
 
 	err := s.createDirectoriesAndControlFiles(s.dataDir, bucket, key)
@@ -840,7 +885,7 @@ func (s *ltosServer) PutObject(bucket, key string, data []byte, metadata map[str
 	return nil
 }
 
-func (s *ltosServer) createDirectoriesAndControlFiles(dataDir, bucket, objectKey string) error {
+func (s *objStoreServer) createDirectoriesAndControlFiles(dataDir, bucket, objectKey string) error {
 	fullPath := filepath.Join(dataDir, bucket, objectKey)
 	os.MkdirAll(filepath.Dir(fullPath), 0755)
 
@@ -875,7 +920,7 @@ func (s *ltosServer) createDirectoriesAndControlFiles(dataDir, bucket, objectKey
 	return nil
 }
 
-func (s *ltosServer) handleMultipartUpload(w http.ResponseWriter, r *http.Request) {
+func (s *objStoreServer) handleMultipartUpload(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	bucketName := vars["bucket"]
 	objectKey := vars["object"]
@@ -892,7 +937,7 @@ func (s *ltosServer) handleMultipartUpload(w http.ResponseWriter, r *http.Reques
 	}
 }
 
-func (s *ltosServer) InitiateMultipartUpload(bucket, key string) (string, error) {
+func (s *objStoreServer) InitiateMultipartUpload(bucket, key string) (string, error) {
 	uploadID := generateUploadID()
 	uploadDir := filepath.Join(s.dataDir, bucket, fmt.Sprintf("%s.%s", key, uploadID))
 	err := os.MkdirAll(uploadDir, 0755)
@@ -902,7 +947,7 @@ func (s *ltosServer) InitiateMultipartUpload(bucket, key string) (string, error)
 	return uploadID, nil
 }
 
-func (s *ltosServer) initiateMultipartUpload(w http.ResponseWriter, r *http.Request, bucketName, objectKey string) {
+func (s *objStoreServer) initiateMultipartUpload(w http.ResponseWriter, r *http.Request, bucketName, objectKey string) {
 	// Generate upload ID
 	uploadID, err := s.InitiateMultipartUpload(bucketName, objectKey)
 	if err != nil {
@@ -927,7 +972,7 @@ func (s *ltosServer) initiateMultipartUpload(w http.ResponseWriter, r *http.Requ
 	xml.NewEncoder(w).Encode(response)
 }
 
-func (s *ltosServer) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Request) {
+func (s *objStoreServer) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 
 	bucketName := vars["bucket"]
@@ -960,7 +1005,7 @@ func (s *ltosServer) handleCreateMultipartUpload(w http.ResponseWriter, r *http.
 	xml.NewEncoder(w).Encode(response)
 }
 
-func (s *ltosServer) handleNewMultipartUpload(w http.ResponseWriter, r *http.Request) {
+func (s *objStoreServer) handleNewMultipartUpload(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	bucketName := vars["bucket"]
 	objectKey := vars["object"]
@@ -991,7 +1036,7 @@ func generateUploadID() string {
 	return fmt.Sprintf("%d", time.Now().UnixNano())
 }
 
-func (s *ltosServer) handleUploadPart(w http.ResponseWriter, r *http.Request) {
+func (s *objStoreServer) handleUploadPart(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	bucketName := vars["bucket"]
 	objectKey := vars["object"]
@@ -1021,7 +1066,7 @@ func (s *ltosServer) handleUploadPart(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func (s *ltosServer) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Request) {
+func (s *objStoreServer) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	bucketName := vars["bucket"]
 	objectKey := vars["object"]
@@ -1051,7 +1096,7 @@ func (s *ltosServer) handleCompleteMultipartUpload(w http.ResponseWriter, r *htt
 	xml.NewEncoder(w).Encode(response)
 }
 
-func (s *ltosServer) PutObjectPart(bucket, key, uploadID string, partNumber int, data []byte) error {
+func (s *objStoreServer) PutObjectPart(bucket, key, uploadID string, partNumber int, data []byte) error {
 	// Create the directory for this multipart upload if it doesn't exist
 	uploadDir := filepath.Join(s.dataDir, bucket, fmt.Sprintf("%s.%s", key, uploadID))
 	if err := os.MkdirAll(uploadDir, 0755); err != nil {
@@ -1067,7 +1112,7 @@ func (s *ltosServer) PutObjectPart(bucket, key, uploadID string, partNumber int,
 	return nil
 }
 
-func (s *ltosServer) CompleteMultipartUpload(bucket, key, uploadID string, parts []CompletedPart) error {
+func (s *objStoreServer) CompleteMultipartUpload(bucket, key, uploadID string, parts []CompletedPart) error {
 	uploadDir := filepath.Join(s.dataDir, bucket, fmt.Sprintf("%s.%s", key, uploadID))
 	finalPath := filepath.Join(s.dataDir, bucket, key)
 
@@ -1133,7 +1178,7 @@ func (s *ltosServer) CompleteMultipartUpload(bucket, key, uploadID string, parts
 	return nil
 }
 
-func (s *ltosServer) replicateObject(bucketName, key string, data []byte, metadata map[string]string) error {
+func (s *objStoreServer) replicateObject(bucketName, key string, data []byte, metadata map[string]string) error {
 	replicaPath := filepath.Join(s.dataDirReplica, bucketName, key)
 
 	// Ensure the directory structure exists
@@ -1154,12 +1199,12 @@ func (s *ltosServer) replicateObject(bucketName, key string, data []byte, metada
 	if err != nil {
 		return fmt.Errorf("failed to write file contents: %v", err)
 	}
-	s.createCtrFile(s.dataDirReplica, bucketName, key)
+	s.createControlFile(s.dataDirReplica, bucketName, key)
 
 	return nil
 }
 
-func (s *ltosServer) replicateObjectFileCopy(bucketName, key string) error {
+func (s *objStoreServer) replicateObjectFileCopy(bucketName, key string) error {
 	sourcePath := filepath.Join(s.dataDir, bucketName, key)
 	replicaPath := filepath.Join(s.dataDirReplica, bucketName, key)
 
@@ -1192,7 +1237,7 @@ func (s *ltosServer) replicateObjectFileCopy(bucketName, key string) error {
 	return nil
 }
 
-func (s *ltosServer) copyFile(src, dst string) error {
+func (s *objStoreServer) copyFile(src, dst string) error {
 	sourceFile, err := os.Open(src)
 	if err != nil {
 		return err
@@ -1238,7 +1283,7 @@ func calculateETag(parts []CompletedPart) string {
 	return fmt.Sprintf("%s-%d", finalETag, len(parts))
 }
 
-func (s *ltosServer) handleHeadCmdBucket(w http.ResponseWriter, r *http.Request, bucketName string) error {
+func (s *objStoreServer) handleHeadCmdBucket(w http.ResponseWriter, r *http.Request, bucketName string) error {
 	path := filepath.Join(s.dataDir, bucketName)
 	info, err := os.Stat(path)
 	if err != nil {
@@ -1271,7 +1316,7 @@ func (s *ltosServer) handleHeadCmdBucket(w http.ResponseWriter, r *http.Request,
 	return nil
 }
 
-func (s *ltosServer) handleHeadObject(w http.ResponseWriter, r *http.Request, bucketName, objectKey string) {
+func (s *objStoreServer) handleHeadObject(w http.ResponseWriter, r *http.Request, bucketName, objectKey string) {
 	// Get object metadata
 	metadata, err := s.GetObjectMetadata(bucketName, objectKey, r.Header.Get("Content-Type"))
 	if err != nil {
@@ -1313,7 +1358,7 @@ func isHidden(path string) bool {
 	return false
 }
 
-func (s *ltosServer) ListObjectsV2(bucket, prefix string, maxKeys int) ([]Object, error) {
+func (s *objStoreServer) ListObjectsV2(bucket, prefix string, maxKeys int) ([]Object, error) {
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
@@ -1383,7 +1428,7 @@ func (s *ltosServer) ListObjectsV2(bucket, prefix string, maxKeys int) ([]Object
 	return objects, nil
 }
 
-func (s *ltosServer) ListBucket(bucket string) ([]Object, error) {
+func (s *objStoreServer) ListBucket(bucket string) ([]Object, error) {
 	bucketPath := filepath.Join(s.dataDir, bucket)
 
 	entries, err := ioutil.ReadDir(bucketPath)
@@ -1497,7 +1542,7 @@ func extractMetadata(header http.Header) map[string]string {
 	}
 	return metadata
 }
-func (s *ltosServer) replicateObjectFile(sourceBucket, replicaBucket, object string, data io.Reader) error {
+func (s *objStoreServer) replicateObjectFile(sourceBucket, replicaBucket, object string, data io.Reader) error {
 	content, err := ioutil.ReadAll(data)
 	if err != nil {
 		return fmt.Errorf("failed to read object data: %v", err)
@@ -1514,7 +1559,7 @@ func (rm *ReplicationManager) RemoveReplica(sourceBucket string) {
 	delete(rm.replicas, sourceBucket)
 }
 
-func (s *ltosServer) deleteBucket(bucket string) error {
+func (s *objStoreServer) deleteBucket(bucket string) error {
 	bucketPath := filepath.Join(s.dataDir, bucket)
 	err := s.DeleteBucket(bucketPath)
 	if err == nil {
@@ -1524,7 +1569,7 @@ func (s *ltosServer) deleteBucket(bucket string) error {
 	return err
 }
 
-func (s *ltosServer) DeleteBucket(bucketPath string) error {
+func (s *objStoreServer) DeleteBucket(bucketPath string) error {
 	// Check if the bucket exists
 	if _, err := os.Stat(bucketPath); os.IsNotExist(err) {
 		return nil
@@ -1543,7 +1588,7 @@ func (s *ltosServer) DeleteBucket(bucketPath string) error {
 	return nil
 }
 
-func (s *ltosServer) handleBucketCmdsLocation(w http.ResponseWriter, r *http.Request) {
+func (s *objStoreServer) handleBucketCmdsLocation(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
 
@@ -1573,11 +1618,11 @@ func (s *ltosServer) handleBucketCmdsLocation(w http.ResponseWriter, r *http.Req
 	w.Write([]byte(xml.Header + string(xmlResponse)))
 }
 
-func (s *ltosServer) getBucketLocation(bucket string) (string, error) {
+func (s *objStoreServer) getBucketLocation(bucket string) (string, error) {
 	return "us-east-1", nil
 }
 
-func (s *ltosServer) createDirectoriesAll(bucket, objectKey string) error {
+func (s *objStoreServer) createDirectoriesAll(bucket, objectKey string) error {
 	fullPath := filepath.Join(s.dataDir, bucket, objectKey)
 	err := os.MkdirAll(fullPath, 0755)
 	if err != nil {
@@ -1592,7 +1637,7 @@ func (s *ltosServer) createDirectoriesAll(bucket, objectKey string) error {
 	return nil
 }
 
-func (s *ltosServer) createCtrFile(dataDir, bucket, objectKey string) error {
+func (s *objStoreServer) createControlFile(dataDir, bucket, objectKey string) error {
 	fullPath := filepath.Join(dataDir, bucket, objectKey)
 
 	if strings.HasSuffix(objectKey, "/") {
@@ -1634,4 +1679,390 @@ func splitBaseDir(path string) (string, string) {
 	}
 
 	return path, ""
+}
+
+func (s *objStoreServer) PutBucketACLHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	vars := mux.Vars(r)
+	bucket := vars["bucket"]
+
+	// 1. Check if the bucket exists
+	s.mu.Lock()
+	exists := s.bucketNames[bucket]
+	s.mu.Unlock()
+
+	if !exists {
+		s.writeErrorResponse(ctx, w, APIError{
+			Code:           "NoSuchBucket",
+			Description:    "The specified bucket does not exist",
+			HTTPStatusCode: http.StatusNotFound,
+		}, r.URL)
+		return
+	}
+
+	// 2. Check if the user has permission to set the ACL
+	// Note: You'll need to implement your own permission checking mechanism
+	if !s.isAllowed(ctx, r, bucket, "s3:PutBucketAcl") {
+		s.writeErrorResponse(ctx, w, APIError{
+			Code:           "AccessDenied",
+			Description:    "You don't have permission to set the ACL on this bucket",
+			HTTPStatusCode: http.StatusForbidden,
+		}, r.URL)
+		return
+	}
+
+	// 3. Parse the ACL from the request
+	var acl *BucketACL
+	var err error
+
+	aclHeader := r.Header.Get("x-amz-acl")
+	if aclHeader != "" {
+		acl, err = s.parseBucketACLHeader(aclHeader)
+		if err != nil {
+			log.Printf("Error parsing ACL header: %v", err)
+			s.writeErrorResponse(ctx, w, APIError{
+				Code:           "InvalidArgument",
+				Description:    "Invalid ACL header",
+				HTTPStatusCode: http.StatusBadRequest,
+			}, r.URL)
+			return
+		}
+	} else {
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			log.Printf("Error reading request body: %v", err)
+			s.writeErrorResponse(ctx, w, APIError{
+				Code:           "InvalidArgument",
+				Description:    "Unable to read request body",
+				HTTPStatusCode: http.StatusBadRequest,
+			}, r.URL)
+			return
+		}
+		acl, err = s.parseBucketACLFromBody(bodyBytes)
+		if err != nil {
+			log.Printf("Error parsing ACL from body: %v", err)
+			s.writeErrorResponse(ctx, w, APIError{
+				Code:           "MalformedACLError",
+				Description:    "The XML you provided was not well-formed or did not validate against our published schema",
+				HTTPStatusCode: http.StatusBadRequest,
+			}, r.URL)
+			return
+		}
+	}
+
+	// 4. Validate the ACL
+	if err := s.validateBucketACL(acl); err != nil {
+		log.Printf("ACL validation failed: %v", err)
+		s.writeErrorResponse(ctx, w, APIError{
+			Code:           "InvalidArgument",
+			Description:    "Invalid ACL structure",
+			HTTPStatusCode: http.StatusBadRequest,
+		}, r.URL)
+		return
+	}
+
+	// 5. Apply the ACL to the bucket
+	// Note: You'll need to implement this method to work with your storage backend
+	if err := s.setBucketACL(ctx, bucket, acl); err != nil {
+		log.Printf("Error setting bucket ACL: %v", err)
+		s.writeErrorResponse(ctx, w, APIError{
+			Code:           "InternalError",
+			Description:    "We encountered an internal error. Please try again.",
+			HTTPStatusCode: http.StatusInternalServerError,
+		}, r.URL)
+		return
+	}
+
+	// 6. Send a success response
+	s.writeSuccessResponseHeadersOnly(w)
+	log.Printf("Successfully set ACL for bucket: %s", bucket)
+}
+
+// Helper methods that you'll need to implement:
+
+func (s *objStoreServer) isAllowed(ctx context.Context, r *http.Request, bucket, action string) bool {
+	// Get the user from the request context
+	// This assumes you have middleware that authenticates the user and puts their info in the context
+	user, ok := ctx.Value("user").(string)
+	if !ok {
+		// If there's no user in the context, deny access
+		return false
+	}
+
+	// Check if the user is objstoreadmin
+	if user == "objstoreadmin" {
+		// objstoreadmin has full permissions
+		return true
+	}
+
+	// For other users, you might want to implement more granular permission checks
+	// This could involve checking against a database of user roles and permissions
+	// For now, we'll just deny access to non-admin users
+	return false
+}
+
+func (s *objStoreServer) parseBucketACLHeader(header string) (*BucketACL, error) {
+	// Implement parsing logic for predefined ACLs
+	switch strings.ToLower(header) {
+	case "private":
+		return &BucketACL{
+			Owner: Owner{ID: "OwnerID", DisplayName: "OwnerName"},
+			AccessRules: []AccessRule{
+				{
+					Grantee:    Grantee{ID: "OwnerID", DisplayName: "OwnerName", Type: "CanonicalUser"},
+					Permission: "FULL_CONTROL",
+				},
+			},
+		}, nil
+	case "public-read":
+		return &BucketACL{
+			Owner: Owner{ID: "OwnerID", DisplayName: "OwnerName"},
+			AccessRules: []AccessRule{
+				{
+					Grantee:    Grantee{ID: "OwnerID", DisplayName: "OwnerName", Type: "CanonicalUser"},
+					Permission: "FULL_CONTROL",
+				},
+				{
+					Grantee:    Grantee{URI: "http://acs.amazonaws.com/groups/global/AllUsers", Type: "Group"},
+					Permission: "READ",
+				},
+			},
+		}, nil
+	case "public-read-write":
+		return &BucketACL{
+			Owner: Owner{ID: "OwnerID", DisplayName: "OwnerName"},
+			AccessRules: []AccessRule{
+				{
+					Grantee:    Grantee{ID: "OwnerID", DisplayName: "OwnerName", Type: "CanonicalUser"},
+					Permission: "FULL_CONTROL",
+				},
+				{
+					Grantee:    Grantee{URI: "http://acs.amazonaws.com/groups/global/AllUsers", Type: "Group"},
+					Permission: "READ",
+				},
+				{
+					Grantee:    Grantee{URI: "http://acs.amazonaws.com/groups/global/AllUsers", Type: "Group"},
+					Permission: "WRITE",
+				},
+			},
+		}, nil
+	// Add other predefined ACLs as needed
+	default:
+		return nil, errors.New("invalid ACL header")
+	}
+}
+
+func (s *objStoreServer) parseBucketACLFromBody(body []byte) (*BucketACL, error) {
+	// Implement parsing logic for XML ACL in the request body
+	var acl BucketACL
+	err := xml.Unmarshal(body, &acl)
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate the parsed ACL
+	if acl.Owner.ID == "" || len(acl.AccessRules) == 0 {
+		return nil, errors.New("invalid ACL structure")
+	}
+
+	return &acl, nil
+}
+
+func (s *objStoreServer) validateBucketACL(acl *BucketACL) error {
+	if acl == nil {
+		return errors.New("ACL is nil")
+	}
+
+	if acl.Owner.ID == "" {
+		return errors.New("ACL must have an owner")
+	}
+
+	if len(acl.AccessRules) == 0 {
+		return errors.New("ACL must have at least one access rule")
+	}
+
+	for _, rule := range acl.AccessRules {
+		if rule.Grantee.Type == "" {
+			return errors.New("each grantee must have a type")
+		}
+
+		switch rule.Grantee.Type {
+		case "CanonicalUser":
+			if rule.Grantee.ID == "" {
+				return errors.New("CanonicalUser grantee must have an ID")
+			}
+		case "Group":
+			if rule.Grantee.URI == "" {
+				return errors.New("Group grantee must have a URI")
+			}
+		default:
+			return fmt.Errorf("unknown grantee type: %s", rule.Grantee.Type)
+		}
+
+		switch rule.Permission {
+		case "READ", "WRITE", "READ_ACP", "WRITE_ACP", "FULL_CONTROL":
+			// Valid permissions
+		default:
+			return fmt.Errorf("invalid permission: %s", rule.Permission)
+		}
+	}
+
+	return nil
+}
+
+func (s *objStoreServer) setBucketACL(ctx context.Context, bucket string, acl *BucketACL) error {
+	// First, validate the ACL
+	if err := s.validateBucketACL(acl); err != nil {
+		return err
+	}
+
+	// Here, you would typically update the ACL in your storage backend
+	// This is a placeholder implementation - you'll need to replace this
+	// with actual logic to update your storage system
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Check if the bucket exists
+	if _, exists := s.bucketNames[bucket]; !exists {
+		return errors.New("bucket does not exist")
+	}
+
+	// In a real implementation, you might do something like:
+	// s.storage.UpdateBucketACL(bucket, acl)
+
+	// For now, we'll just log that we're setting the ACL
+	log.Printf("Setting ACL for bucket %s: %+v", bucket, acl)
+
+	return nil
+}
+
+func (s *objStoreServer) writeErrorResponse(ctx context.Context, w http.ResponseWriter, apiErr APIError, reqURL *url.URL) {
+	w.WriteHeader(apiErr.HTTPStatusCode)
+
+	errorResponse := ErrorResponse{
+		Code:       apiErr.Code,
+		Message:    apiErr.Description,
+		BucketName: reqURL.Query().Get("bucket"),
+		RequestID:  ctx.Value("requestID").(string),
+		HostID:     "YourHostID", // Replace with actual host ID if available
+	}
+
+	encoder := xml.NewEncoder(w)
+	encoder.Encode(errorResponse)
+}
+
+func (s *objStoreServer) writeSuccessResponseHeadersOnly(w http.ResponseWriter) {
+	w.WriteHeader(http.StatusOK)
+	w.Header().Set("x-amz-request-id", uuid.New().String())
+	// Add any other headers you want to include in a successful response
+}
+
+func (s *objStoreServer) GetBucketACLHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	vars := mux.Vars(r)
+	bucketName := vars["bucket"]
+
+	// 1. Check if the bucket exists
+	if !s.BucketExists(bucketName) {
+		s.writeErrorResponse(ctx, w, APIError{
+			Code:           "NoSuchBucket",
+			Description:    "The specified bucket does not exist",
+			HTTPStatusCode: http.StatusNotFound,
+		}, r.URL)
+		return
+	}
+
+	// 2. Check if the user has permission to get the ACL
+	if !s.isAllowed(ctx, r, bucketName, "s3:GetBucketAcl") {
+		s.writeErrorResponse(ctx, w, APIError{
+			Code:           "AccessDenied",
+			Description:    "You don't have permission to access the ACL for this bucket",
+			HTTPStatusCode: http.StatusForbidden,
+		}, r.URL)
+		return
+	}
+
+	// 3. Retrieve the ACL for the bucket
+	acl, err := s.getBucketACL(ctx, bucketName)
+	if err != nil {
+		s.writeErrorResponse(ctx, w, APIError{
+			Code:           "InternalError",
+			Description:    "We encountered an internal error. Please try again.",
+			HTTPStatusCode: http.StatusInternalServerError,
+		}, r.URL)
+		return
+	}
+
+	// 4. Prepare the response
+	response := &GetBucketACLResponse{
+		Owner:       acl.Owner,
+		AccessRules: acl.AccessRules,
+	}
+
+	// 5. Write the response
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(http.StatusOK)
+	encoder := xml.NewEncoder(w)
+	if err := encoder.Encode(response); err != nil {
+		log.Printf("Error encoding ACL response: %v", err)
+		// At this point, we've already started writing the response,
+		// so we can't send an error response. We'll just have to log it.
+	}
+}
+
+// GetBucketACLResponse represents the XML structure for the GetBucketACL response
+type GetBucketACLResponse struct {
+	XMLName     xml.Name     `xml:"AccessControlPolicy"`
+	Owner       Owner        `xml:"Owner"`
+	AccessRules []AccessRule `xml:"AccessControlList>Grant"`
+}
+
+// You'll need to implement this method to retrieve the ACL from your storage backend
+func (s *objStoreServer) getBucketACL(ctx context.Context, bucketName string) (*BucketACL, error) {
+	// This is a placeholder implementation
+	// In a real scenario, you would retrieve this from your storage backend
+	return &BucketACL{
+		Owner: Owner{
+			ID:          "OwnerID",
+			DisplayName: "OwnerName",
+		},
+		AccessRules: []AccessRule{
+			{
+				Grantee: Grantee{
+					ID:          "OwnerID",
+					DisplayName: "OwnerName",
+					Type:        "CanonicalUser",
+				},
+				Permission: "FULL_CONTROL",
+			},
+		},
+	}, nil
+}
+
+func (s *objStoreServer) BucketACLHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	bucket := vars["bucket"]
+
+	// Check if the bucket exists
+	if !s.BucketExists(bucket) {
+		s.writeErrorResponse(r.Context(), w, APIError{
+			Code:           "NoSuchBucket",
+			Description:    "The specified bucket does not exist",
+			HTTPStatusCode: http.StatusNotFound,
+		}, r.URL)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		s.GetBucketACLHandler(w, r)
+	case http.MethodPut:
+		s.PutBucketACLHandler(w, r)
+	default:
+		s.writeErrorResponse(r.Context(), w, APIError{
+			Code:           "MethodNotAllowed",
+			Description:    "The specified method is not allowed against this resource",
+			HTTPStatusCode: http.StatusMethodNotAllowed,
+		}, r.URL)
+	}
 }
