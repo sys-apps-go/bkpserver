@@ -33,6 +33,14 @@ const (
 	objectStoreDataDirReplica = "/mnt/objsdatarepl/"
 )
 
+const (
+	authTypeUnknown   = "unknown"
+	authTypeSigned    = "signed"
+	authTypePresigned = "presigned"
+	authTypeJWT       = "jwt"
+	authTypeAnonymous = "anonymous"
+)
+
 type Object struct {
 	Key          string
 	LastModified time.Time
@@ -1349,39 +1357,6 @@ func calculateETag(parts []CompletedPart) string {
 	return fmt.Sprintf("%s-%d", finalETag, len(parts))
 }
 
-func (s *objStoreServer) handleHeadCmdBucket(w http.ResponseWriter, r *http.Request, bucketName string) error {
-	path := filepath.Join(s.dataDir, bucketName)
-	info, err := os.Stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			http.Error(w, "Bucket not found", http.StatusNotFound)
-		} else {
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-		}
-		return err
-	}
-
-	if !info.IsDir() {
-		http.Error(w, "Not a bucket", http.StatusBadRequest)
-		return fmt.Errorf("not a bucket: %s", bucketName)
-	}
-
-	// Set Last-Modified header
-	lastModified := info.ModTime().UTC().Format(time.RFC1123)
-	w.Header().Set("Last-Modified", lastModified)
-
-	// Set other required headers
-	w.Header().Set("Content-Length", "0") // Directories typically have no content
-	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("x-amz-request-id", generateUniqueID())
-
-	// Optionally set ETag for bucket
-	// w.Header().Set("ETag", calculateBucketETag(bucketName))
-
-	w.WriteHeader(http.StatusOK)
-	return nil
-}
-
 func (s *objStoreServer) handleHeadObject(w http.ResponseWriter, r *http.Request, bucketName, objectKey string) {
 	// Get object metadata
 	metadata, err := s.GetObjectMetadata(bucketName, objectKey, r.Header.Get("Content-Type"))
@@ -1412,6 +1387,39 @@ func (s *objStoreServer) handleHeadObject(w http.ResponseWriter, r *http.Request
 	w.WriteHeader(http.StatusOK)
 	//log.Printf("Successfully responded to HEAD request: bucket=%s, key=%s, size=%d, isDirectory=%v",
 	//	bucketName, objectKey, metadata.Size, metadata.IsDirectory)
+}
+func (s *objStoreServer) handleHeadCmdBucket(w http.ResponseWriter, r *http.Request, bucketName string) error {
+	path := filepath.Join(s.dataDir, bucketName)
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			w.WriteHeader(http.StatusNotFound)
+			return fmt.Errorf("bucket not found: %s", bucketName)
+		} else {
+			w.WriteHeader(http.StatusInternalServerError)
+			return fmt.Errorf("internal server error: %v", err)
+		}
+	}
+
+	if !info.IsDir() {
+		w.WriteHeader(http.StatusBadRequest)
+		return fmt.Errorf("not a bucket: %s", bucketName)
+	}
+
+	// Set Last-Modified header
+	lastModified := info.ModTime().UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")
+	w.Header().Set("Last-Modified", lastModified)
+
+	// Set other required headers
+	w.Header().Set("Content-Length", "0") // Directories typically have no content
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("x-amz-request-id", generateUniqueID())
+
+	// Optionally set ETag for bucket
+	// w.Header().Set("ETag", calculateBucketETag(bucketName))
+
+	w.WriteHeader(http.StatusOK)
+	return nil
 }
 
 func isHidden(path string) bool {
@@ -1535,6 +1543,81 @@ func (s *objStoreServer) ListBucket(bucket string) ([]Object, error) {
 	}
 
 	return objects, nil
+}
+
+func authMiddlewareNew(accessKeyID, secretAccessKey string) mux.MiddlewareFunc {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Extract authentication information
+			authInfo := extractAuthInfo(r)
+
+			// Validate the authentication
+			if !validateAuth(authInfo, accessKeyID, secretAccessKey) {
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+
+			// Determine the authentication type
+			authType := getRequestAuthType(r)
+
+			// Handle the request based on the authentication type
+			switch authType {
+			case authTypeSigned:
+				fmt.Fprintf(w, "Request is authenticated using signed method.")
+			case authTypePresigned:
+				fmt.Fprintf(w, "Request is authenticated using presigned URL.")
+			case authTypeJWT:
+				fmt.Fprintf(w, "Request is authenticated using JWT.")
+			case authTypeAnonymous:
+				fmt.Fprintf(w, "Request is anonymous.")
+			default:
+				http.Error(w, "Unknown authentication type", http.StatusUnauthorized)
+				return
+			}
+
+			// If authentication is successful and the request is handled, proceed to the next handler
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// Function to determine authentication type
+func getRequestAuthType(r *http.Request) string {
+	if authHeader := r.Header.Get("Authorization"); authHeader != "" {
+		if isRequestSignatureV4(r) {
+			return authTypeSigned
+		} else if isRequestPresignedSignature(r) {
+			return authTypePresigned
+		} else if isRequestJWT(r) {
+			return authTypeJWT
+		}
+	}
+
+	if r.FormValue("action") != "" {
+		return authTypeAnonymous
+	}
+
+	return authTypeAnonymous
+}
+
+// Implement signature check logic
+func isRequestSignatureV4(r *http.Request) bool {
+	authHeader := r.Header.Get("Authorization")
+	return strings.HasPrefix(authHeader, "AWS4-HMAC-SHA256")
+}
+
+// Implement presigned URL check logic
+func isRequestPresignedSignature(r *http.Request) bool {
+	// Check for typical presigned URL parameters
+	return r.URL.Query().Get("X-Amz-Signature") != "" &&
+		r.URL.Query().Get("X-Amz-Date") != "" &&
+		r.URL.Query().Get("X-Amz-Expires") != ""
+}
+
+// Implement JWT validation logic
+func isRequestJWT(r *http.Request) bool {
+	authHeader := r.Header.Get("Authorization")
+	return strings.HasPrefix(authHeader, "Bearer ")
 }
 
 func authMiddleware(accessKeyID, secretAccessKey string) mux.MiddlewareFunc {
@@ -2475,19 +2558,18 @@ func (s *objStoreServer) PutObjectACL(w http.ResponseWriter, r *http.Request, bu
 }
 
 func (s *objStoreServer) saveMetadataIndex(bucketName string) error {
-    s.mu.Lock()
-    defer s.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-    bucketIndex, exists := s.metadataIndex[bucketName]
-    if !exists {
-        return fmt.Errorf("metadata index not found for bucket: %s", bucketName)
-    }
+	bucketIndex, exists := s.metadataIndex[bucketName]
+	if !exists {
+		return fmt.Errorf("metadata index not found for bucket: %s", bucketName)
+	}
 
-    data, err := json.Marshal(bucketIndex.index)
-    if err != nil {
-        return err
-    }
+	data, err := json.Marshal(bucketIndex.index)
+	if err != nil {
+		return err
+	}
 
-    return ioutil.WriteFile(bucketIndex.file, data, 0644)
+	return ioutil.WriteFile(bucketIndex.file, data, 0644)
 }
-
