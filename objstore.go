@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
@@ -161,6 +160,7 @@ type objStoreServer struct {
 	multipartUploads   sync.Map
 	replicationManager *ReplicationManager
 	metadataIndex      map[string]MetadataIndex
+	replicationOn      bool
 	mu                 sync.Mutex
 }
 
@@ -248,6 +248,7 @@ func newLiteObjectStoreServer(primaryFs, replicaFs string) *objStoreServer {
 		replicationManager: NewReplicationManager(),
 		bucketNames:        make(map[string]bool),
 		metadataIndex:      make(map[string]MetadataIndex),
+		replicationOn:      false,
 	}
 	return s
 }
@@ -511,6 +512,11 @@ func (s *objStoreServer) handleObjectCmds(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	if s.replicationOn {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+	}
+
 	isDir := false
 	if strings.HasSuffix(objectKey, "/") {
 		isDir = true
@@ -537,27 +543,32 @@ func (s *objStoreServer) handleObjectCmds(w http.ResponseWriter, r *http.Request
 
 		// Set headers based on metadata
 		w.Header().Set("Content-Type", metadata.ContentType)
+		w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
 		w.Header().Set("ETag", metadata.ETag)
 		w.Header().Set("Last-Modified", metadata.LastModified.UTC().Format(http.TimeFormat))
 
+		if !s.replicationOn {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+		}
+		// Handle range requests
 		rangeHeader := r.Header.Get("Range")
-		var start, end int64 = 0, metadata.Size - 1
-
 		if rangeHeader != "" {
-			var err error
-			start, end, err = parseRange(rangeHeader, metadata.Size)
+			// Parse and handle range request
+			// This is a simplified example; you'll need to implement full range parsing
+			start, end, err := parseRange(rangeHeader, metadata.Size)
 			if err != nil {
 				s.sendErrorResponse(w, "InvalidRange", http.StatusRequestedRangeNotSatisfiable)
 				return
 			}
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, metadata.Size))
+			w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
 			w.WriteHeader(http.StatusPartialContent)
 		} else {
 			w.WriteHeader(http.StatusOK)
 		}
 
-		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
-
+		// Stream the object data
 		reader, err := s.GetObjectReader(bucketName, objectKey)
 		if err != nil {
 			log.Printf("Error getting object reader: %v", err)
@@ -566,27 +577,13 @@ func (s *objStoreServer) handleObjectCmds(w http.ResponseWriter, r *http.Request
 		}
 		defer reader.Close()
 
-		_, err = reader.Seek(start, io.SeekStart)
+		// Copy the data to the response writer
+		_, err = io.Copy(w, reader)
 		if err != nil {
-			log.Printf("Error seeking in file: %v", err)
-			s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
-			return
+			log.Printf("Error streaming object data: %v", err)
 		}
 
-		// Use a buffered writer for efficiency
-		bufWriter := bufio.NewWriterSize(w, 64*1024) // 64KB buffer
-		_, err = io.CopyN(bufWriter, reader, end-start+1)
-		if err != nil {
-			if err != io.EOF {
-				log.Printf("Error streaming object data: %v", err)
-			}
-		}
-
-		err = bufWriter.Flush()
-		if err != nil {
-			log.Printf("Error flushing buffer: %v", err)
-		}
-
+		return
 	case "PUT":
 		if isDir {
 			s.createDirectoriesAll(bucketName, objectKey)
@@ -617,16 +614,20 @@ func (s *objStoreServer) handleObjectCmds(w http.ResponseWriter, r *http.Request
 			return
 		}
 
-		err = s.replicateObject(bucketName, objectKey, body, metadata)
-		if err != nil {
-			log.Printf("Failed to replicate object %s/%s: %v", bucketName, objectKey, err)
-			// Optionally handle the replication failure
+		if s.replicationOn {
+			err = s.replicateObject(bucketName, objectKey, body, metadata)
+			if err != nil {
+				log.Printf("Failed to replicate object %s/%s: %v", bucketName, objectKey, err)
+				// Optionally handle the replication failure
+			}
 		}
 
 		indexFile := "." + "metadata.index"
 		objectPath := filepath.Join(s.dataDir, bucketName, objectKey)
 		objectMetaPath := filepath.Join(s.dataDir, bucketName, indexFile)
-		s.mu.Lock()
+		if !s.replicationOn {
+			s.mu.Lock()
+		}
 		bucketIndex, exists := s.metadataIndex[bucketName]
 		if !exists {
 			bucketIndex = MetadataIndex{
@@ -635,7 +636,9 @@ func (s *objStoreServer) handleObjectCmds(w http.ResponseWriter, r *http.Request
 			}
 			s.metadataIndex[bucketName] = bucketIndex
 		}
-		s.mu.Unlock()
+		if !s.replicationOn {
+			s.mu.Unlock()
+		}
 
 		contentType := r.Header.Get("Content-Type")
 		if contentType == "" {
@@ -660,10 +663,14 @@ func (s *objStoreServer) handleObjectCmds(w http.ResponseWriter, r *http.Request
 			}
 		}
 
-		s.mu.Lock()
+		if !s.replicationOn {
+			s.mu.Lock()
+		}
 		bucketIndex.index[objectKey] = append(bucketIndex.index[objectKey], metadataAttr)
 		s.metadataIndex[bucketName] = bucketIndex
-		s.mu.Unlock()
+		if !s.replicationOn {
+			s.mu.Unlock()
+		}
 
 		//s.saveMetadataIndex(bucketName)
 
@@ -964,9 +971,11 @@ func (s *objStoreServer) PutObject(bucket, key string, data []byte, metadata map
 		return err
 	}
 
-	err = s.createDirectoriesAndControlFiles(s.dataDirReplica, bucket, key)
-	if err != nil {
-		return err
+	if s.replicationOn {
+		err = s.createDirectoriesAndControlFiles(s.dataDirReplica, bucket, key)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Write the file
@@ -1268,12 +1277,14 @@ func (s *objStoreServer) CompleteMultipartUpload(bucket, key, uploadID string, p
 		log.Printf("Warning: failed to remove upload directory: %v", err)
 	}
 
-	// Replica the object to the mirror bucket
-	err = s.replicateObjectFileCopy(bucket, key)
-	if err != nil {
-		log.Printf("Failed to replicate object %s/%s: %v", bucket, key, err)
-		// Optionally, you could return this error if you want to ensure replication succeeds
-		// return fmt.Errorf("failed to replicate object: %v", err)
+	if s.replicationOn {
+		// Replica the object to the mirror bucket
+		err = s.replicateObjectFileCopy(bucket, key)
+		if err != nil {
+			log.Printf("Failed to replicate object %s/%s: %v", bucket, key, err)
+			// Optionally, you could return this error if you want to ensure replication succeeds
+			// return fmt.Errorf("failed to replicate object: %v", err)
+		}
 	}
 
 	return nil
@@ -1409,11 +1420,11 @@ func (s *objStoreServer) handleHeadObject(w http.ResponseWriter, r *http.Request
 	w.Header().Set("x-amz-request-id", generateUniqueID())     // Implement this function
 
 	// Log the headers for debugging
-	//log.Printf("Headers for %v/%v: %v", metadata, objectKey, w.Header())
+	log.Printf("Headers for %v/%v: %v", metadata, objectKey, w.Header())
 
 	w.WriteHeader(http.StatusOK)
-	//log.Printf("Successfully responded to HEAD request: bucket=%s, key=%s, size=%d, isDirectory=%v",
-	//	bucketName, objectKey, metadata.Size, metadata.IsDirectory)
+	log.Printf("Successfully responded to HEAD request: bucket=%s, key=%s, size=%d, isDirectory=%v",
+		bucketName, objectKey, metadata.Size, metadata.IsDirectory)
 }
 func (s *objStoreServer) handleHeadCmdBucket(w http.ResponseWriter, r *http.Request, bucketName string) error {
 	path := filepath.Join(s.dataDir, bucketName)
@@ -1717,16 +1728,6 @@ func extractMetadata(header http.Header) map[string]string {
 		}
 	}
 	return metadata
-}
-func (s *objStoreServer) replicateObjectFile(sourceBucket, replicaBucket, object string, data io.Reader) error {
-	content, err := ioutil.ReadAll(data)
-	if err != nil {
-		return fmt.Errorf("failed to read object data: %v", err)
-	}
-
-	metadata := make(map[string]string)
-
-	return s.PutObject(replicaBucket, object, content, metadata)
 }
 
 func (rm *ReplicationManager) RemoveReplica(sourceBucket string) {
