@@ -42,11 +42,14 @@ type Object struct {
 }
 
 type ObjectMetadata struct {
-	Size         int64
-	LastModified time.Time
-	ETag         string
-	IsDirectory  bool
-	ContentType  string
+	Key              string // Search key
+	FullPath         string // Full path of the file
+	Size             int64
+	LastModified     time.Time
+	ETag             string
+	ContentType      string
+	IsDirectory      bool
+	CustomAttributes map[string]string
 }
 
 type ObjectInfo struct {
@@ -135,6 +138,11 @@ type ObjectACL struct {
 	AccessRules []AccessRule `xml:"AccessControlList>Grant"`
 }
 
+type MetadataIndex struct {
+	index map[string][]ObjectMetadata
+	file  string
+}
+
 type objStoreServer struct {
 	storage            StorageBackend
 	dataDir            string
@@ -143,6 +151,7 @@ type objStoreServer struct {
 	bucketNames        map[string]bool
 	multipartUploads   sync.Map
 	replicationManager *ReplicationManager
+	metadataIndex      map[string]MetadataIndex
 	mu                 sync.Mutex
 }
 
@@ -229,6 +238,7 @@ func newLiteObjectStoreServer(primaryFs, replicaFs string) *objStoreServer {
 		dataDirReplica:     replicaFs,
 		replicationManager: NewReplicationManager(),
 		bucketNames:        make(map[string]bool),
+		metadataIndex:      make(map[string]MetadataIndex),
 	}
 	return s
 }
@@ -576,6 +586,51 @@ func (s *objStoreServer) handleObjectCmds(w http.ResponseWriter, r *http.Request
 			log.Printf("Failed to replicate object %s/%s: %v", bucketName, objectKey, err)
 			// Optionally handle the replication failure
 		}
+
+		indexFile := "." + "metadata.index"
+		objectPath := filepath.Join(s.dataDir, bucketName, objectKey)
+		objectMetaPath := filepath.Join(s.dataDir, bucketName, indexFile)
+		s.mu.Lock()
+		bucketIndex, exists := s.metadataIndex[bucketName]
+		if !exists {
+			bucketIndex = MetadataIndex{
+				index: make(map[string][]ObjectMetadata),
+				file:  objectMetaPath,
+			}
+			s.metadataIndex[bucketName] = bucketIndex
+		}
+		s.mu.Unlock()
+
+		contentType := r.Header.Get("Content-Type")
+		if contentType == "" {
+			contentType = "application/octet-stream"
+		}
+		info, _ := os.Stat(objectPath)
+		metadataAttr := ObjectMetadata{
+			Key:              filepath.Dir(objectKey),
+			FullPath:         objectPath,
+			Size:             info.Size(),
+			LastModified:     info.ModTime(),
+			ETag:             fmt.Sprintf("%x", md5.Sum(body)), // Assuming you have the file data
+			ContentType:      contentType,
+			IsDirectory:      info.IsDir(),
+			CustomAttributes: make(map[string]string),
+		}
+
+		// Add custom attributes from headers
+		for k, v := range r.Header {
+			if strings.HasPrefix(k, "X-Amz-Meta-") {
+				metadataAttr.CustomAttributes[strings.TrimPrefix(k, "X-Amz-Meta-")] = v[0]
+			}
+		}
+
+		s.mu.Lock()
+		bucketIndex.index[objectKey] = append(bucketIndex.index[objectKey], metadataAttr)
+		s.metadataIndex[bucketName] = bucketIndex
+		s.mu.Unlock()
+
+		//s.saveMetadataIndex(bucketName)
+
 		// Send success response
 		w.WriteHeader(http.StatusOK)
 	case "DELETE":
@@ -2418,3 +2473,21 @@ func (s *objStoreServer) PutObjectACL(w http.ResponseWriter, r *http.Request, bu
 	// Send success response
 	w.WriteHeader(http.StatusOK)
 }
+
+func (s *objStoreServer) saveMetadataIndex(bucketName string) error {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    bucketIndex, exists := s.metadataIndex[bucketName]
+    if !exists {
+        return fmt.Errorf("metadata index not found for bucket: %s", bucketName)
+    }
+
+    data, err := json.Marshal(bucketIndex.index)
+    if err != nil {
+        return err
+    }
+
+    return ioutil.WriteFile(bucketIndex.file, data, 0644)
+}
+
