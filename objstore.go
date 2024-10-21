@@ -130,6 +130,11 @@ type Bucket struct {
 	CreationDate time.Time
 }
 
+type ObjectACL struct {
+	Owner       Owner        `xml:"Owner"`
+	AccessRules []AccessRule `xml:"AccessControlList>Grant"`
+}
+
 type objStoreServer struct {
 	storage            StorageBackend
 	dataDir            string
@@ -746,6 +751,12 @@ func (s *objStoreServer) BucketExists(name string) bool {
 
 func (s *objStoreServer) BucketExistsReplica(name string) bool {
 	_, err := os.Stat(filepath.Join(s.dataDirReplica, name))
+	return !os.IsNotExist(err)
+}
+
+func (s *objStoreServer) ObjectExists(bucket, key string) bool {
+	objectPath := filepath.Join(s.dataDir, bucket, key)
+	_, err := os.Stat(objectPath)
 	return !os.IsNotExist(err)
 }
 
@@ -2065,4 +2076,253 @@ func (s *objStoreServer) BucketACLHandler(w http.ResponseWriter, r *http.Request
 			HTTPStatusCode: http.StatusMethodNotAllowed,
 		}, r.URL)
 	}
+}
+
+func (s *objStoreServer) PutObjectACLHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	bucket := vars["bucket"]
+	key := vars["key"]
+	versionID := r.URL.Query().Get("versionId")
+
+	// 1. Check if bucket and object exist
+	if !s.BucketExists(bucket) || !s.ObjectExists(bucket, key) {
+		s.writeErrorResponse(r.Context(), w, APIError{
+			Code:           "NoSuchKey",
+			Description:    "The specified key does not exist.",
+			HTTPStatusCode: http.StatusNotFound,
+		}, r.URL)
+		return
+	}
+
+	// 2. Check permissions
+	if !s.isAllowed(r.Context(), r, bucket, "s3:PutObjectAcl") {
+		s.writeErrorResponse(r.Context(), w, APIError{
+			Code:           "AccessDenied",
+			Description:    "Access Denied",
+			HTTPStatusCode: http.StatusForbidden,
+		}, r.URL)
+		return
+	}
+
+	// 3. Parse ACL
+	acl, err := s.parseObjectACLFromRequest(r)
+	if err != nil {
+		s.writeErrorResponse(r.Context(), w, APIError{
+			Code:           "MalformedACLError",
+			Description:    "The XML you provided was not well-formed or did not validate against our published schema",
+			HTTPStatusCode: http.StatusBadRequest,
+		}, r.URL)
+		return
+	}
+
+	// 4. Apply ACL
+	err = s.setObjectACL(bucket, key, versionID, acl)
+	if err != nil {
+		s.writeErrorResponse(r.Context(), w, APIError{
+			Code:           "InternalError",
+			Description:    "We encountered an internal error. Please try again.",
+			HTTPStatusCode: http.StatusInternalServerError,
+		}, r.URL)
+		return
+	}
+
+	// 5. Send success response
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *objStoreServer) GetObjectACLHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	bucket := vars["bucket"]
+	key := vars["key"]
+	versionID := r.URL.Query().Get("versionId")
+
+	// 1. Check if bucket and object exist
+	if !s.BucketExists(bucket) || !s.ObjectExists(bucket, key) {
+		s.writeErrorResponse(r.Context(), w, APIError{
+			Code:           "NoSuchKey",
+			Description:    "The specified key does not exist.",
+			HTTPStatusCode: http.StatusNotFound,
+		}, r.URL)
+		return
+	}
+
+	// 2. Check permissions
+	if !s.isAllowed(r.Context(), r, bucket, "s3:GetObjectAcl") {
+		s.writeErrorResponse(r.Context(), w, APIError{
+			Code:           "AccessDenied",
+			Description:    "Access Denied",
+			HTTPStatusCode: http.StatusForbidden,
+		}, r.URL)
+		return
+	}
+
+	// 3. Get the ACL
+	acl, err := s.getObjectACL(bucket, key, versionID)
+	if err != nil {
+		s.writeErrorResponse(r.Context(), w, APIError{
+			Code:           "InternalError",
+			Description:    "We encountered an internal error. Please try again.",
+			HTTPStatusCode: http.StatusInternalServerError,
+		}, r.URL)
+		return
+	}
+
+	// 4. Prepare and send the response
+	response := &GetObjectACLResponse{
+		Owner:       acl.Owner,
+		AccessRules: acl.AccessRules,
+	}
+
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(http.StatusOK)
+	if err := xml.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("Error encoding ACL response: %v", err)
+	}
+}
+
+type GetObjectACLResponse struct {
+	XMLName     xml.Name     `xml:"AccessControlPolicy"`
+	Owner       Owner        `xml:"Owner"`
+	AccessRules []AccessRule `xml:"AccessControlList>Grant"`
+}
+
+func (s *objStoreServer) getObjectACL(bucket, key, versionID string) (*ObjectACL, error) {
+	// Implementation to get the ACL from your storage backend
+	// This is a placeholder - you need to implement this based on your storage system
+	return &ObjectACL{
+		Owner: Owner{ID: "OwnerID", DisplayName: "OwnerName"},
+		AccessRules: []AccessRule{
+			{
+				Grantee:    Grantee{ID: "OwnerID", DisplayName: "OwnerName", Type: "CanonicalUser"},
+				Permission: "FULL_CONTROL",
+			},
+		},
+	}, nil
+}
+
+func (s *objStoreServer) parseObjectACLFromRequest(r *http.Request) (*ObjectACL, error) {
+	// Check for canned ACL in header
+	cannedACL := r.Header.Get("x-amz-acl")
+	if cannedACL != "" {
+		return s.parseCannedACL(cannedACL)
+	}
+
+	// Check for grant headers
+	acl := &ObjectACL{
+		Owner:       Owner{ID: "OwnerID", DisplayName: "OwnerName"}, // You should set this to the actual owner
+		AccessRules: []AccessRule{},
+	}
+
+	grantRead := r.Header.Get("x-amz-grant-read")
+	grantWrite := r.Header.Get("x-amz-grant-write")
+	grantReadACP := r.Header.Get("x-amz-grant-read-acp")
+	grantWriteACP := r.Header.Get("x-amz-grant-write-acp")
+	grantFullControl := r.Header.Get("x-amz-grant-full-control")
+
+	if grantRead != "" {
+		acl.AccessRules = append(acl.AccessRules, s.parseGrantHeader(grantRead, "READ")...)
+	}
+	if grantWrite != "" {
+		acl.AccessRules = append(acl.AccessRules, s.parseGrantHeader(grantWrite, "WRITE")...)
+	}
+	if grantReadACP != "" {
+		acl.AccessRules = append(acl.AccessRules, s.parseGrantHeader(grantReadACP, "READ_ACP")...)
+	}
+	if grantWriteACP != "" {
+		acl.AccessRules = append(acl.AccessRules, s.parseGrantHeader(grantWriteACP, "WRITE_ACP")...)
+	}
+	if grantFullControl != "" {
+		acl.AccessRules = append(acl.AccessRules, s.parseGrantHeader(grantFullControl, "FULL_CONTROL")...)
+	}
+
+	// If no headers, try to parse from body
+	if len(acl.AccessRules) == 0 {
+		body, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			return nil, err
+		}
+		return s.parseACLFromXML(body)
+	}
+
+	return acl, nil
+}
+
+func (s *objStoreServer) parseCannedACL(cannedACL string) (*ObjectACL, error) {
+	// Implement parsing for canned ACLs (private, public-read, etc.)
+	// This is a simplified example
+	switch cannedACL {
+	case "private":
+		return &ObjectACL{
+			Owner: Owner{ID: "OwnerID", DisplayName: "OwnerName"},
+			AccessRules: []AccessRule{
+				{
+					Grantee:    Grantee{ID: "OwnerID", DisplayName: "OwnerName", Type: "CanonicalUser"},
+					Permission: "FULL_CONTROL",
+				},
+			},
+		}, nil
+	// Add other canned ACLs as needed
+	default:
+		return nil, fmt.Errorf("unsupported canned ACL: %s", cannedACL)
+	}
+}
+
+func (s *objStoreServer) parseGrantHeader(grantHeader, permission string) []AccessRule {
+	// Implement parsing of grant headers
+	// This is a simplified example
+	grantees := strings.Split(grantHeader, ",")
+	rules := []AccessRule{}
+	for _, grantee := range grantees {
+		rules = append(rules, AccessRule{
+			Grantee:    Grantee{ID: grantee, Type: "CanonicalUser"},
+			Permission: permission,
+		})
+	}
+	return rules
+}
+
+func (s *objStoreServer) parseACLFromXML(xmlBody []byte) (*ObjectACL, error) {
+	var acl ObjectACL
+	if err := xml.Unmarshal(xmlBody, &acl); err != nil {
+		return nil, err
+	}
+	return &acl, nil
+}
+
+func (s *objStoreServer) setObjectACL(bucket, key, versionID string, acl *ObjectACL) error {
+	// Implementation to set the ACL on the object
+	// This is where you would interact with your storage backend to update the ACL
+	// For example:
+
+	// 1. Validate the ACL
+	if err := s.validateObjectACL(acl); err != nil {
+		return err
+	}
+
+	// 2. Update the ACL in your storage system
+	// This is a placeholder - you need to implement this based on your storage system
+	log.Printf("Setting ACL for object %s/%s (version: %s): %+v", bucket, key, versionID, acl)
+
+	// 3. If you're supporting versioning, you might need to handle the versionID
+	if versionID != "" {
+		// Set ACL for specific version
+	} else {
+		// Set ACL for latest version
+	}
+
+	return nil
+}
+
+func (s *objStoreServer) validateObjectACL(acl *ObjectACL) error {
+	if acl == nil {
+		return errors.New("ACL is nil")
+	}
+	if acl.Owner.ID == "" {
+		return errors.New("ACL must have an owner")
+	}
+	if len(acl.AccessRules) == 0 {
+		return errors.New("ACL must have at least one access rule")
+	}
+	// Add more validation as needed
+	return nil
 }
