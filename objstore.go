@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
@@ -536,29 +537,56 @@ func (s *objStoreServer) handleObjectCmds(w http.ResponseWriter, r *http.Request
 
 		// Set headers based on metadata
 		w.Header().Set("Content-Type", metadata.ContentType)
-		w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
 		w.Header().Set("ETag", metadata.ETag)
-		lastModified := metadata.LastModified.UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")
-		w.Header().Set("Last-Modified", lastModified)
+		w.Header().Set("Last-Modified", metadata.LastModified.UTC().Format(http.TimeFormat))
 
-		if isDir {
+		rangeHeader := r.Header.Get("Range")
+		var start, end int64 = 0, metadata.Size - 1
+
+		if rangeHeader != "" {
+			var err error
+			start, end, err = parseRange(rangeHeader, metadata.Size)
+			if err != nil {
+				s.sendErrorResponse(w, "InvalidRange", http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, metadata.Size))
+			w.WriteHeader(http.StatusPartialContent)
+		} else {
 			w.WriteHeader(http.StatusOK)
-			return
 		}
 
-		// Get the object data
-		data, err := s.GetObject(bucketName, objectKey)
+		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+
+		reader, err := s.GetObjectReader(bucketName, objectKey)
 		if err != nil {
-			log.Printf("Error getting object data: %v", err)
+			log.Printf("Error getting object reader: %v", err)
+			s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
+			return
+		}
+		defer reader.Close()
+
+		_, err = reader.Seek(start, io.SeekStart)
+		if err != nil {
+			log.Printf("Error seeking in file: %v", err)
 			s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
 			return
 		}
 
-		// Write the data to the response
-		_, err = w.Write(data)
+		// Use a buffered writer for efficiency
+		bufWriter := bufio.NewWriterSize(w, 64*1024) // 64KB buffer
+		_, err = io.CopyN(bufWriter, reader, end-start+1)
 		if err != nil {
-			log.Printf("Error writing response: %v", err)
+			if err != io.EOF {
+				log.Printf("Error streaming object data: %v", err)
+			}
 		}
+
+		err = bufWriter.Flush()
+		if err != nil {
+			log.Printf("Error flushing buffer: %v", err)
+		}
+
 	case "PUT":
 		if isDir {
 			s.createDirectoriesAll(bucketName, objectKey)
@@ -738,7 +766,6 @@ func main() {
 				Queries("location", "")
 			r.HandleFunc("/{bucket}", objStoreServer.handleBucketCmds).Methods("HEAD", "GET", "PUT", "DELETE")
 			r.HandleFunc("/{bucket}/", objStoreServer.handleBucketCmds).Methods("HEAD", "GET", "PUT", "DELETE")
-			r.HandleFunc("/{bucket}/{object:.+}", objStoreServer.handleObjectCmds).Methods("GET", "PUT", "DELETE", "HEAD")
 
 			r.HandleFunc("/{bucket}/{object:.+}", objStoreServer.handleNewMultipartUpload).
 				Methods("POST").
@@ -749,6 +776,8 @@ func main() {
 			r.HandleFunc("/{bucket}/{object:.+}", objStoreServer.handleCompleteMultipartUpload).
 				Methods("POST").
 				Queries("uploadId", "{uploadId}")
+			r.HandleFunc("/{bucket}/{object:.+}", objStoreServer.handleObjectCmds).Methods("GET", "PUT", "DELETE", "HEAD")
+			r.HandleFunc("/{bucket}/{object:.+}/", objStoreServer.handleObjectCmds).Methods("GET", "PUT", "DELETE", "HEAD")
 			r.HandleFunc("/{bucket}/acl", objStoreServer.BucketACLHandler).Methods("GET", "PUT")
 
 			// Add logging middleware
@@ -1083,7 +1112,6 @@ func (s *objStoreServer) handleNewMultipartUpload(w http.ResponseWriter, r *http
 	vars := mux.Vars(r)
 	bucketName := vars["bucket"]
 	objectKey := vars["object"]
-
 	// Generate a unique upload ID
 	//uploadID := generateUploadID()
 	// Store initial multipart upload info in your backend
@@ -1145,7 +1173,6 @@ func (s *objStoreServer) handleCompleteMultipartUpload(w http.ResponseWriter, r 
 	bucketName := vars["bucket"]
 	objectKey := vars["object"]
 	uploadID := vars["uploadId"]
-
 	var completeMultipartUpload CompleteMultipartUpload
 	if err := xml.NewDecoder(r.Body).Decode(&completeMultipartUpload); err != nil {
 		s.sendErrorResponse(w, "MalformedXML", http.StatusBadRequest)
@@ -2572,4 +2599,38 @@ func (s *objStoreServer) saveMetadataIndex(bucketName string) error {
 	}
 
 	return ioutil.WriteFile(bucketIndex.file, data, 0644)
+}
+
+func parseRange(rangeHeader string, size int64) (int64, int64, error) {
+	if !strings.HasPrefix(rangeHeader, "bytes=") {
+		return 0, 0, fmt.Errorf("invalid range header format")
+	}
+	parts := strings.Split(strings.TrimPrefix(rangeHeader, "bytes="), "-")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid range header format")
+	}
+	start, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid start range")
+	}
+	end, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		end = size - 1
+	}
+	if start > end || start < 0 || end >= size {
+		return 0, 0, fmt.Errorf("invalid range")
+	}
+	return start, end, nil
+}
+
+func (s *objStoreServer) GetObjectReader(bucketName, objectKey string) (io.ReadSeekCloser, error) {
+	filePath := filepath.Join(s.dataDir, bucketName, objectKey)
+	file, err := os.Open(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("object not found")
+		}
+		return nil, err
+	}
+	return file, nil
 }
