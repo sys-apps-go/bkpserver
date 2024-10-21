@@ -2326,3 +2326,95 @@ func (s *objStoreServer) validateObjectACL(acl *ObjectACL) error {
 	// Add more validation as needed
 	return nil
 }
+
+func (s *objStoreServer) ObjectACLHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	bucket := vars["bucket"]
+	key := vars["key"]
+	versionID := r.URL.Query().Get("versionId")
+
+	// Check if the bucket and object exist
+	if !s.BucketExists(bucket) || !s.ObjectExists(bucket, key) {
+		s.writeErrorResponse(r.Context(), w, APIError{
+			Code:           "NoSuchKey",
+			Description:    "The specified key does not exist.",
+			HTTPStatusCode: http.StatusNotFound,
+		}, r.URL)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		s.GetObjectACL(w, r, bucket, key, versionID)
+	case http.MethodPut:
+		s.PutObjectACL(w, r, bucket, key, versionID)
+	default:
+		s.writeErrorResponse(r.Context(), w, APIError{
+			Code:           "MethodNotAllowed",
+			Description:    "The specified method is not allowed against this resource.",
+			HTTPStatusCode: http.StatusMethodNotAllowed,
+		}, r.URL)
+	}
+}
+
+func (s *objStoreServer) GetObjectACL(w http.ResponseWriter, r *http.Request, bucket, key, versionID string) {
+	// Check permissions
+	if !s.isAllowed(r.Context(), r, bucket, "s3:GetObjectAcl") {
+		s.writeErrorResponse(r.Context(), w, APIError{
+			Code:           "AccessDenied",
+			Description:    "Access Denied",
+			HTTPStatusCode: http.StatusForbidden,
+		}, r.URL)
+		return
+	}
+
+	acl, err := s.getObjectACL(bucket, key, versionID)
+	if err != nil {
+		s.writeErrorResponse(r.Context(), w, APIError{
+			Code:           "InternalError",
+			Description:    "We encountered an internal error. Please try again.",
+			HTTPStatusCode: http.StatusInternalServerError,
+		}, r.URL)
+		return
+	}
+
+	// Write the ACL response
+	w.Header().Set("Content-Type", "application/xml")
+	if err := xml.NewEncoder(w).Encode(acl); err != nil {
+		log.Printf("Error encoding ACL response: %v", err)
+	}
+}
+
+func (s *objStoreServer) PutObjectACL(w http.ResponseWriter, r *http.Request, bucket, key, versionID string) {
+	// Check permissions
+	if !s.isAllowed(r.Context(), r, bucket, "s3:PutObjectAcl") {
+		s.writeErrorResponse(r.Context(), w, APIError{
+			Code:           "AccessDenied",
+			Description:    "Access Denied",
+			HTTPStatusCode: http.StatusForbidden,
+		}, r.URL)
+		return
+	}
+
+	acl, err := s.parseObjectACLFromRequest(r)
+	if err != nil {
+		s.writeErrorResponse(r.Context(), w, APIError{
+			Code:           "MalformedACLError",
+			Description:    "The XML you provided was not well-formed or did not validate against our published schema",
+			HTTPStatusCode: http.StatusBadRequest,
+		}, r.URL)
+		return
+	}
+
+	if err := s.setObjectACL(bucket, key, versionID, acl); err != nil {
+		s.writeErrorResponse(r.Context(), w, APIError{
+			Code:           "InternalError",
+			Description:    "We encountered an internal error. Please try again.",
+			HTTPStatusCode: http.StatusInternalServerError,
+		}, r.URL)
+		return
+	}
+
+	// Send success response
+	w.WriteHeader(http.StatusOK)
+}
