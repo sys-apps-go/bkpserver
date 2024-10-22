@@ -160,7 +160,7 @@ type objStoreServer struct {
 	multipartUploads   sync.Map
 	replicationManager *ReplicationManager
 	metadataIndex      map[string]MetadataIndex
-	replicationOn      bool
+	bucketReplication  map[string]string
 	mu                 sync.Mutex
 }
 
@@ -248,7 +248,7 @@ func newLiteObjectStoreServer(primaryFs, replicaFs string) *objStoreServer {
 		replicationManager: NewReplicationManager(),
 		bucketNames:        make(map[string]bool),
 		metadataIndex:      make(map[string]MetadataIndex),
-		replicationOn:      false,
+		bucketReplication:  make(map[string]string),
 	}
 	return s
 }
@@ -796,6 +796,9 @@ func main() {
 				Queries("uploadId", "{uploadId}")
 			r.HandleFunc("/{bucket}/{object:.+}", objStoreServer.handleObjectCmds).Methods("GET", "PUT", "DELETE", "HEAD")
 			r.HandleFunc("/{bucket}/{object:.+}/", objStoreServer.handleObjectCmds).Methods("GET", "PUT", "DELETE", "HEAD")
+			r.HandleFunc("/{bucket}", objStoreServer.handlePutBucketReplication).
+				Methods("PUT").
+				Queries("replication", "")
 			r.HandleFunc("/{bucket}/acl", objStoreServer.BucketACLHandler).Methods("GET", "PUT")
 
 			// Add logging middleware
@@ -818,7 +821,7 @@ func main() {
 
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		//log.Printf("Received request: %s %s", r.Method, r.URL)
+		log.Printf("Received request: %s %s", r.Method, r.URL)
 		next.ServeHTTP(w, r)
 	})
 }
@@ -2634,4 +2637,79 @@ func (s *objStoreServer) GetObjectReader(bucketName, objectKey string) (io.ReadS
 		return nil, err
 	}
 	return file, nil
+}
+
+func (s *objStoreServer) handlePutBucketReplication(w http.ResponseWriter, r *http.Request) {
+    bucketName := mux.Vars(r)["bucket"]
+    if !isValidBucketName(bucketName) {
+        s.sendErrorResponse(w, "InvalidBucketName", http.StatusBadRequest)
+        return
+    }
+
+    // Check if the bucket exists
+    if _, exists := s.bucketNames[bucketName]; !exists {
+        s.sendErrorResponse(w, "NoSuchBucket", http.StatusNotFound)
+        return
+    }
+
+    replicationConfig, err := parseReplicationConfig(r.Body)
+    if err != nil {
+        s.sendErrorResponse(w, "InvalidReplicationConfigurationXML", http.StatusBadRequest)
+        return
+    }
+
+    // Serialize the replicationConfig to JSON
+    replicationConfigJSON, err := json.Marshal(replicationConfig)
+    if err != nil {
+        s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
+        return
+    }
+
+    // Store the JSON string instead of the struct
+    s.bucketReplication[bucketName] = string(replicationConfigJSON)
+
+    // Start replication using the ReplicationManager
+    err = s.replicationManager.StartReplication(bucketName, replicationConfig)
+    if err != nil {
+        s.sendErrorResponse(w, "ReplicationConfigurationError", http.StatusInternalServerError)
+        return
+    }
+
+    // Update metadata
+    if s.metadataIndex[bucketName] == nil {
+        s.metadataIndex[bucketName] = &MetadataIndex{}
+    }
+    s.metadataIndex[bucketName].ReplicationEnabled = true
+    s.metadataIndex[bucketName].ReplicationConfig = string(replicationConfigJSON)
+
+    // Send success response
+    w.WriteHeader(http.StatusOK)
+    w.Write([]byte("Replication configuration applied successfully"))
+}
+
+type ReplicationConfig struct {
+    Role  string `json:"Role"`
+    Rules []struct {
+        Status                 string `json:"Status"`
+        Priority               int    `json:"Priority"`
+        DeleteMarkerReplication struct {
+            Status string `json:"Status"`
+        } `json:"DeleteMarkerReplication"`
+        Filter struct {
+            Prefix string `json:"Prefix"`
+        } `json:"Filter"`
+        Destination struct {
+            Bucket string `json:"Bucket"`
+        } `json:"Destination"`
+    } `json:"Rules"`
+}
+
+func parseReplicationConfig(body io.Reader) (ReplicationConfig, error) {
+    var config ReplicationConfig
+    decoder := json.NewDecoder(body)
+    err := decoder.Decode(&config)
+    if err != nil {
+        return ReplicationConfig{}, err
+    }
+    return config, nil
 }
