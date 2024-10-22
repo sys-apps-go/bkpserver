@@ -474,18 +474,18 @@ func (s *objStoreServer) handleBucketCmds(w http.ResponseWriter, r *http.Request
 			return
 		}
 
-		// Create replica bucket
-		replicaBucket := bucketName
-		err = s.CreateBucketReplica(replicaBucket)
-		if err != nil {
-			http.Error(w, "Failed to create replica bucket: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
 		s.mu.Lock()
-		s.bucketNames[bucketName] = true
+		_, exists = s.bucketReplication[bucketName]
 		s.mu.Unlock()
-
+		if exists {
+			// Create replica bucket
+			replicaBucket := bucketName
+			err = s.CreateBucketReplica(replicaBucket)
+			if err != nil {
+				http.Error(w, "Failed to create replica bucket: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
 		// Add to replication manager
 		w.WriteHeader(http.StatusOK)
 		w.Header().Set("Location", "/"+bucketName)
@@ -505,7 +505,7 @@ func (s *objStoreServer) handleBucketCmds(w http.ResponseWriter, r *http.Request
 /* Process the following commands:
  * Put: Create Object
  * Head: Get Object Status
- * Get: List all files and prefixes under the path 
+ * Get: List all files and prefixes under the path
  * Delete: Delete the object
  */
 func (s *objStoreServer) handleObjectCmds(w http.ResponseWriter, r *http.Request) {
@@ -633,12 +633,6 @@ func (s *objStoreServer) handleObjectCmds(w http.ResponseWriter, r *http.Request
 			return
 		}
 
-		err = s.replicateObject(bucketName, objectKey, body, metadata)
-		if err != nil {
-			log.Printf("Failed to replicate object %s/%s: %v", bucketName, objectKey, err)
-			// Optionally handle the replication failure
-		}
-
 		indexFile := "." + "metadata.index"
 		objectPath := filepath.Join(s.dataDir, bucketName, objectKey)
 		objectMetaPath := filepath.Join(s.dataDir, bucketName, indexFile)
@@ -681,7 +675,6 @@ func (s *objStoreServer) handleObjectCmds(w http.ResponseWriter, r *http.Request
 		bucketIndex.index[objectKey] = append(bucketIndex.index[objectKey], metadataAttr)
 		s.metadataIndex[bucketName] = bucketIndex
 		s.mu.Unlock()
-	
 
 		//s.saveMetadataIndex(bucketName)
 
@@ -972,37 +965,36 @@ func (s *objStoreServer) GetObjectMetadata(bucket, key string, contentType strin
 }
 
 func (s *objStoreServer) PutObject(bucket, key string, data []byte, metadata map[string]string) error {
+	err := s.createDirectoriesAndControlFiles(s.dataDir, bucket, key, metadata)
+	if err != nil {
+		return err
+	}
+
 	fullPath := filepath.Join(s.dataDir, bucket, key)
-
-	err := s.createDirectoriesAndControlFiles(s.dataDir, bucket, key)
-	if err != nil {
-		return err
-	}
-
-	err = s.createDirectoriesAndControlFiles(s.dataDirReplica, bucket, key)
-	if err != nil {
-		return err
-	}
 	// Write the file
 	if err := ioutil.WriteFile(fullPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write file: %v", err)
 	}
 
-	// Store metadata for regular files
-	metadataPath := filepath.Join(filepath.Dir(fullPath), "."+filepath.Base(key)+".metadata")
-	metadataJSON, err := json.Marshal(metadata)
-	if err != nil {
-		return fmt.Errorf("failed to marshal metadata: %v", err)
-	}
-
-	if err := ioutil.WriteFile(metadataPath, metadataJSON, 0644); err != nil {
-		return fmt.Errorf("failed to write metadata: %v", err)
+	s.mu.Lock()
+	replicaBucket, exists := s.bucketReplication[bucket]
+	s.mu.Unlock()
+	if exists {
+		err = s.createDirectoriesAndControlFiles(s.dataDirReplica, replicaBucket, key, metadata)
+		if err != nil {
+			return err
+		}
+		fullPath = filepath.Join(s.dataDirReplica, replicaBucket, key)
+		// Write the file
+		if err := ioutil.WriteFile(fullPath, data, 0644); err != nil {
+			return fmt.Errorf("failed to write file: %v", err)
+		}
 	}
 
 	return nil
 }
 
-func (s *objStoreServer) createDirectoriesAndControlFiles(dataDir, bucket, objectKey string) error {
+func (s *objStoreServer) createDirectoriesAndControlFiles(dataDir, bucket, objectKey string, metadataReq map[string]string) error {
 	fullPath := filepath.Join(dataDir, bucket, objectKey)
 	os.MkdirAll(filepath.Dir(fullPath), 0755)
 
@@ -1026,6 +1018,10 @@ func (s *objStoreServer) createDirectoriesAndControlFiles(dataDir, bucket, objec
 			"CreatedAt": time.Now().UTC().Format(time.RFC3339),
 			"Path":      controlFilePath,
 		}
+		for key, value := range metadataReq {
+			metadata[key] = value
+		}
+
 		metadataJSON, err := json.Marshal(metadata)
 		if err != nil {
 			return fmt.Errorf("failed to marshal metadata: %v", err)
@@ -1282,46 +1278,26 @@ func (s *objStoreServer) CompleteMultipartUpload(bucket, key, uploadID string, p
 		log.Printf("Warning: failed to remove upload directory: %v", err)
 	}
 
-	// Replica the object to the mirror bucket
-	err = s.replicateObjectFileCopy(bucket, key)
-	if err != nil {
-		log.Printf("Failed to replicate object %s/%s: %v", bucket, key, err)
-		// Optionally, you could return this error if you want to ensure replication succeeds
-		// return fmt.Errorf("failed to replicate object: %v", err)
+	s.mu.Lock()
+	_, exists := s.bucketReplication[bucket]
+	s.mu.Unlock()
+	if exists {
+		// Replica the object to the mirror bucket
+		err = s.replicateObjectFileCopy(bucket, key, finalPath, controlFilePath)
+		if err != nil {
+			log.Printf("Failed to replicate object %s/%s: %v", bucket, key, err)
+			// Optionally, you could return this error if you want to ensure replication succeeds
+			// return fmt.Errorf("failed to replicate object: %v", err)
+		}
 	}
 
 	return nil
 }
 
-func (s *objStoreServer) replicateObject(bucketName, key string, data []byte, metadata map[string]string) error {
+func (s *objStoreServer) replicateObjectFileCopy(bucketName, key string, fullPath, controlFileFullPath string) error {
+	sourcePath := fullPath
 	replicaPath := filepath.Join(s.dataDirReplica, bucketName, key)
-
-	// Ensure the directory structure exists
-	dir := filepath.Dir(replicaPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("failed to create directory structure: %v", err)
-	}
-
-	// Create the file
-	replicaFile, err := os.Create(replicaPath)
-	if err != nil {
-		return fmt.Errorf("failed to create replica file: %v", err)
-	}
-	defer replicaFile.Close()
-
-	// Write the data to the file
-	_, err = replicaFile.Write(data)
-	if err != nil {
-		return fmt.Errorf("failed to write file contents: %v", err)
-	}
-	s.createControlFile(s.dataDirReplica, bucketName, key)
-
-	return nil
-}
-
-func (s *objStoreServer) replicateObjectFileCopy(bucketName, key string) error {
-	sourcePath := filepath.Join(s.dataDir, bucketName, key)
-	replicaPath := filepath.Join(s.dataDirReplica, bucketName, key)
+	replicaControlFileFullPath := filepath.Join(filepath.Dir(replicaPath), filepath.Base(controlFileFullPath))
 
 	// Ensure the directory structure exists
 	dir := filepath.Dir(replicaPath)
@@ -1338,6 +1314,25 @@ func (s *objStoreServer) replicateObjectFileCopy(bucketName, key string) error {
 
 	// Create the replica file
 	replicaFile, err := os.Create(replicaPath)
+	if err != nil {
+		return fmt.Errorf("failed to create replica file: %v", err)
+	}
+	defer replicaFile.Close()
+
+	// Copy the contents
+	_, err = io.Copy(replicaFile, sourceFile)
+	if err != nil {
+		return fmt.Errorf("failed to copy file contents: %v", err)
+	}
+
+	sourceFile, err = os.Open(controlFileFullPath)
+	if err != nil {
+		return fmt.Errorf("failed to open control file: %v", err)
+	}
+	defer sourceFile.Close()
+
+	// Create the replica file
+	replicaFile, err = os.Create(replicaControlFileFullPath)
 	if err != nil {
 		return fmt.Errorf("failed to create replica file: %v", err)
 	}
@@ -1530,7 +1525,7 @@ func (s *objStoreServer) ListObjectsV2(bucket, prefix string, maxKeys int) ([]Ob
 		}
 
 		if maxKeys != 0 && count >= maxKeys {
-		//	return filepath.SkipDir
+			//	return filepath.SkipDir
 		}
 
 		return nil
@@ -1743,8 +1738,13 @@ func (s *objStoreServer) deleteBucket(bucket string) error {
 	bucketPath := filepath.Join(s.dataDir, bucket)
 	err := s.DeleteBucket(bucketPath)
 	if err == nil {
-		bucketPath = filepath.Join(s.dataDirReplica, bucket)
-		err = s.DeleteBucket(bucketPath)
+		s.mu.Lock()
+		replicaBucket, exists := s.bucketReplication[bucket]
+		s.mu.Unlock()
+		if exists {
+			bucketPath = filepath.Join(s.dataDirReplica, replicaBucket)
+			err = s.DeleteBucket(bucketPath)
+		}
 	}
 	return err
 }
@@ -1809,44 +1809,14 @@ func (s *objStoreServer) createDirectoriesAll(bucket, objectKey string) error {
 		return err
 	}
 
-	fullPath = filepath.Join(s.dataDirReplica, bucket, objectKey)
-	err = os.MkdirAll(fullPath, 0755)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func (s *objStoreServer) createControlFile(dataDir, bucket, objectKey string) error {
-	fullPath := filepath.Join(dataDir, bucket, objectKey)
-
-	if strings.HasSuffix(objectKey, "/") {
-		return nil
-	}
-
-	base, dir := splitBaseDir(objectKey)
-
-	objectCtrl := base
-	if !strings.HasPrefix(objectCtrl, ".") {
-		objectCtrl = "." + objectCtrl
-	}
-	if strings.HasSuffix(objectCtrl, "/") {
-		objectCtrl = objectCtrl[0 : len(objectCtrl)-1]
-	}
-	objectCtrl = objectCtrl + ".metadata"
-	fullPath = filepath.Join(dataDir, bucket, dir, objectCtrl)
-
-	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
-		metadata := map[string]string{
-			"CreatedAt": time.Now().UTC().Format(time.RFC3339),
-			"Path":      fullPath,
-		}
-		metadataJSON, err := json.Marshal(metadata)
+	s.mu.Lock()
+	replicaBucket, exists := s.bucketReplication[bucket]
+	s.mu.Unlock()
+	if exists {
+		fullPath = filepath.Join(s.dataDirReplica, replicaBucket, objectKey)
+		err = os.MkdirAll(fullPath, 0755)
 		if err != nil {
-			return fmt.Errorf("failed to marshal metadata: %v", err)
-		}
-		if err := ioutil.WriteFile(fullPath, metadataJSON, 0644); err != nil {
-			return fmt.Errorf("failed to write control file: %v", err)
+			return err
 		}
 	}
 	return nil
@@ -2640,76 +2610,65 @@ func (s *objStoreServer) GetObjectReader(bucketName, objectKey string) (io.ReadS
 }
 
 func (s *objStoreServer) handlePutBucketReplication(w http.ResponseWriter, r *http.Request) {
-    bucketName := mux.Vars(r)["bucket"]
-    if !isValidBucketName(bucketName) {
-        s.sendErrorResponse(w, "InvalidBucketName", http.StatusBadRequest)
-        return
-    }
+	bucketName := mux.Vars(r)["bucket"]
+	if !isValidBucketName(bucketName) {
+		s.sendErrorResponse(w, "InvalidBucketName", http.StatusBadRequest)
+		return
+	}
 
-    // Check if the bucket exists
-    if _, exists := s.bucketNames[bucketName]; !exists {
-        s.sendErrorResponse(w, "NoSuchBucket", http.StatusNotFound)
-        return
-    }
+	// Check if the bucket exists
+	if _, exists := s.bucketNames[bucketName]; !exists {
+		s.sendErrorResponse(w, "NoSuchBucket", http.StatusNotFound)
+		return
+	}
 
-    replicationConfig, err := parseReplicationConfig(r.Body)
-    if err != nil {
-        s.sendErrorResponse(w, "InvalidReplicationConfigurationXML", http.StatusBadRequest)
-        return
-    }
+	replicationConfig, err := parseReplicationConfig(r.Body)
+	if err != nil {
+		s.sendErrorResponse(w, "InvalidReplicationConfigurationXML", http.StatusBadRequest)
+		return
+	}
 
-    // Serialize the replicationConfig to JSON
-    replicationConfigJSON, err := json.Marshal(replicationConfig)
-    if err != nil {
-        s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
-        return
-    }
+	// Serialize the replicationConfig to JSON
+	replicationConfigJSON, err := json.Marshal(replicationConfig)
+	if err != nil {
+		s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
+		return
+	}
 
-    // Store the JSON string instead of the struct
-    s.bucketReplication[bucketName] = string(replicationConfigJSON)
+	// Store the JSON string instead of the struct
+	s.mu.Lock()
+	s.bucketReplication[bucketName] = string(replicationConfigJSON)
+	s.bucketNames[bucketName] = true
+	s.mu.Unlock()
 
-    // Start replication using the ReplicationManager
-    err = s.replicationManager.StartReplication(bucketName, replicationConfig)
-    if err != nil {
-        s.sendErrorResponse(w, "ReplicationConfigurationError", http.StatusInternalServerError)
-        return
-    }
-
-    // Update metadata
-    if s.metadataIndex[bucketName] == nil {
-        s.metadataIndex[bucketName] = &MetadataIndex{}
-    }
-    s.metadataIndex[bucketName].ReplicationEnabled = true
-    s.metadataIndex[bucketName].ReplicationConfig = string(replicationConfigJSON)
-
-    // Send success response
-    w.WriteHeader(http.StatusOK)
-    w.Write([]byte("Replication configuration applied successfully"))
+	// Send success response
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Replication configuration applied successfully"))
 }
 
 type ReplicationConfig struct {
-    Role  string `json:"Role"`
-    Rules []struct {
-        Status                 string `json:"Status"`
-        Priority               int    `json:"Priority"`
-        DeleteMarkerReplication struct {
-            Status string `json:"Status"`
-        } `json:"DeleteMarkerReplication"`
-        Filter struct {
-            Prefix string `json:"Prefix"`
-        } `json:"Filter"`
-        Destination struct {
-            Bucket string `json:"Bucket"`
-        } `json:"Destination"`
-    } `json:"Rules"`
+	Role  string `json:"Role"`
+	Rules []struct {
+		Status                  string `json:"Status"`
+		Priority                int    `json:"Priority"`
+		DeleteMarkerReplication struct {
+			Status string `json:"Status"`
+		} `json:"DeleteMarkerReplication"`
+		Filter struct {
+			Prefix string `json:"Prefix"`
+		} `json:"Filter"`
+		Destination struct {
+			Bucket string `json:"Bucket"`
+		} `json:"Destination"`
+	} `json:"Rules"`
 }
 
 func parseReplicationConfig(body io.Reader) (ReplicationConfig, error) {
-    var config ReplicationConfig
-    decoder := json.NewDecoder(body)
-    err := decoder.Decode(&config)
-    if err != nil {
-        return ReplicationConfig{}, err
-    }
-    return config, nil
+	var config ReplicationConfig
+	decoder := json.NewDecoder(body)
+	err := decoder.Decode(&config)
+	if err != nil {
+		return ReplicationConfig{}, err
+	}
+	return config, nil
 }
