@@ -969,14 +969,8 @@ func (s *objStoreServer) GetObjectMetadata(bucket, key string, contentType strin
 		ContentType:  contentType,
 	}
 
-	if !info.IsDir() {
-		content, err := ioutil.ReadFile(path)
-		if err != nil {
-			return nil, err
-		}
-		hash := md5.Sum(content)
-		metadata.ETag = fmt.Sprintf("\"%x\"", hash)
-	}
+	hash := md5.Sum([]byte(path))
+	metadata.ETag = fmt.Sprintf("\"%x\"", hash)
 
 	return metadata, nil
 }
