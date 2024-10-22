@@ -502,6 +502,12 @@ func (s *objStoreServer) handleBucketCmds(w http.ResponseWriter, r *http.Request
 
 }
 
+/* Process the following commands:
+ * Put: Create Object
+ * Head: Get Object Status
+ * Get: List all files and prefixes under the path 
+ * Delete: Delete the object
+ */
 func (s *objStoreServer) handleObjectCmds(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	bucketName := vars["bucket"]
@@ -559,7 +565,7 @@ func (s *objStoreServer) handleObjectCmds(w http.ResponseWriter, r *http.Request
 		}
 
 		// 2. Calculate readSize
-		readSize := end - start
+		readSize := end - start + 1
 		w.Header().Set("Content-Length", strconv.FormatInt(readSize, 10))
 
 		// Get object reader
@@ -974,7 +980,6 @@ func (s *objStoreServer) PutObject(bucket, key string, data []byte, metadata map
 	if err != nil {
 		return err
 	}
-
 	// Write the file
 	if err := ioutil.WriteFile(fullPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write file: %v", err)
@@ -1522,7 +1527,7 @@ func (s *objStoreServer) ListObjectsV2(bucket, prefix string, maxKeys int) ([]Ob
 		}
 
 		if maxKeys != 0 && count >= maxKeys {
-			return filepath.SkipDir
+		//	return filepath.SkipDir
 		}
 
 		return nil
