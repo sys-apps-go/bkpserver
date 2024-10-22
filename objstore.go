@@ -512,14 +512,9 @@ func (s *objStoreServer) handleObjectCmds(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if s.replicationOn {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-	}
-
-	isDir := false
+	isDirectory := false
 	if strings.HasSuffix(objectKey, "/") {
-		isDir = true
+		isDirectory = true
 	}
 
 	// Remove the leading slash if it exists
@@ -603,7 +598,7 @@ func (s *objStoreServer) handleObjectCmds(w http.ResponseWriter, r *http.Request
 		return
 
 	case "PUT":
-		if isDir {
+		if isDirectory {
 			s.createDirectoriesAll(bucketName, objectKey)
 			return
 		}
@@ -632,20 +627,17 @@ func (s *objStoreServer) handleObjectCmds(w http.ResponseWriter, r *http.Request
 			return
 		}
 
-		if s.replicationOn {
-			err = s.replicateObject(bucketName, objectKey, body, metadata)
-			if err != nil {
-				log.Printf("Failed to replicate object %s/%s: %v", bucketName, objectKey, err)
-				// Optionally handle the replication failure
-			}
+		err = s.replicateObject(bucketName, objectKey, body, metadata)
+		if err != nil {
+			log.Printf("Failed to replicate object %s/%s: %v", bucketName, objectKey, err)
+			// Optionally handle the replication failure
 		}
 
 		indexFile := "." + "metadata.index"
 		objectPath := filepath.Join(s.dataDir, bucketName, objectKey)
 		objectMetaPath := filepath.Join(s.dataDir, bucketName, indexFile)
-		if !s.replicationOn {
-			s.mu.Lock()
-		}
+
+		s.mu.Lock()
 		bucketIndex, exists := s.metadataIndex[bucketName]
 		if !exists {
 			bucketIndex = MetadataIndex{
@@ -654,9 +646,7 @@ func (s *objStoreServer) handleObjectCmds(w http.ResponseWriter, r *http.Request
 			}
 			s.metadataIndex[bucketName] = bucketIndex
 		}
-		if !s.replicationOn {
-			s.mu.Unlock()
-		}
+		s.mu.Unlock()
 
 		contentType := r.Header.Get("Content-Type")
 		if contentType == "" {
@@ -681,14 +671,11 @@ func (s *objStoreServer) handleObjectCmds(w http.ResponseWriter, r *http.Request
 			}
 		}
 
-		if !s.replicationOn {
-			s.mu.Lock()
-		}
+		s.mu.Lock()
 		bucketIndex.index[objectKey] = append(bucketIndex.index[objectKey], metadataAttr)
 		s.metadataIndex[bucketName] = bucketIndex
-		if !s.replicationOn {
-			s.mu.Unlock()
-		}
+		s.mu.Unlock()
+	
 
 		//s.saveMetadataIndex(bucketName)
 
@@ -983,11 +970,9 @@ func (s *objStoreServer) PutObject(bucket, key string, data []byte, metadata map
 		return err
 	}
 
-	if s.replicationOn {
-		err = s.createDirectoriesAndControlFiles(s.dataDirReplica, bucket, key)
-		if err != nil {
-			return err
-		}
+	err = s.createDirectoriesAndControlFiles(s.dataDirReplica, bucket, key)
+	if err != nil {
+		return err
 	}
 
 	// Write the file
@@ -1289,14 +1274,12 @@ func (s *objStoreServer) CompleteMultipartUpload(bucket, key, uploadID string, p
 		log.Printf("Warning: failed to remove upload directory: %v", err)
 	}
 
-	if s.replicationOn {
-		// Replica the object to the mirror bucket
-		err = s.replicateObjectFileCopy(bucket, key)
-		if err != nil {
-			log.Printf("Failed to replicate object %s/%s: %v", bucket, key, err)
-			// Optionally, you could return this error if you want to ensure replication succeeds
-			// return fmt.Errorf("failed to replicate object: %v", err)
-		}
+	// Replica the object to the mirror bucket
+	err = s.replicateObjectFileCopy(bucket, key)
+	if err != nil {
+		log.Printf("Failed to replicate object %s/%s: %v", bucket, key, err)
+		// Optionally, you could return this error if you want to ensure replication succeeds
+		// return fmt.Errorf("failed to replicate object: %v", err)
 	}
 
 	return nil
