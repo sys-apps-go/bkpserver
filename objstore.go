@@ -227,6 +227,13 @@ func (s *objStoreServer) CreateBucketReplica(name string) error {
 	return os.Mkdir(filepath.Join(s.dataDirReplica, name), 0755)
 }
 
+func (s *objStoreServer) DeleteBucketReplica(name string) error {
+	if !s.BucketExistsReplica(name) {
+		return nil
+	}
+	return os.RemoveAll(filepath.Join(s.dataDirReplica, name))
+}
+
 func (s *objStoreServer) GetObject(bucket, key string) ([]byte, error) {
 	path := filepath.Join(s.dataDir, bucket, key)
 	return ioutil.ReadFile(path)
@@ -781,7 +788,7 @@ func main() {
 			r.HandleFunc("/", objStoreServer.handleRoot).Methods("GET")
 
 			r.HandleFunc("/{bucket}", objStoreServer.handlePutBucketReplication).
-				Methods("PUT", "GET").
+				Methods("PUT", "GET", "DELETE").
 				Queries("replication", "")
 
 			r.HandleFunc("/{bucket}/", objStoreServer.handleBucketCmdsLocation).
@@ -2683,6 +2690,18 @@ func (s *objStoreServer) handlePutBucketReplication(w http.ResponseWriter, r *ht
 		// 7. Send success response
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("Replication configuration applied successfully"))
+	case "DELETE":
+		s.mu.Lock()
+		bucketReplName := s.bucketReplication[bucketName]
+		s.mu.Unlock()
+
+		s.DeleteBucketReplica(bucketReplName)
+
+		s.mu.Lock()
+		delete(s.bucketReplication, bucketName)
+		delete(s.bucketNames, bucketName)
+		delete(s.bucketReplicationConfig, bucketName)
+		s.mu.Unlock()
 	}
 }
 
