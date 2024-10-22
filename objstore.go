@@ -543,32 +543,31 @@ func (s *objStoreServer) handleObjectCmds(w http.ResponseWriter, r *http.Request
 
 		// Set headers based on metadata
 		w.Header().Set("Content-Type", metadata.ContentType)
-		w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
 		w.Header().Set("ETag", metadata.ETag)
 		w.Header().Set("Last-Modified", metadata.LastModified.UTC().Format(http.TimeFormat))
+		w.Header().Set("Accept-Ranges", "bytes")
 
-		if !s.replicationOn {
-			s.mu.Lock()
-			defer s.mu.Unlock()
-		}
-		// Handle range requests
+		// 1. Get start, end
+		var start, end int64 = 0, metadata.Size - 1
 		rangeHeader := r.Header.Get("Range")
 		if rangeHeader != "" {
-			// Parse and handle range request
-			// This is a simplified example; you'll need to implement full range parsing
-			start, end, err := parseRange(rangeHeader, metadata.Size)
+			var err error
+			start, end, err = parseRange(rangeHeader, metadata.Size)
 			if err != nil {
 				s.sendErrorResponse(w, "InvalidRange", http.StatusRequestedRangeNotSatisfiable)
 				return
 			}
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, metadata.Size))
-			w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
 			w.WriteHeader(http.StatusPartialContent)
 		} else {
 			w.WriteHeader(http.StatusOK)
 		}
 
-		// Stream the object data
+		// 2. Calculate readSize
+		readSize := end - start
+		w.Header().Set("Content-Length", strconv.FormatInt(readSize, 10))
+
+		// Get object reader
 		reader, err := s.GetObjectReader(bucketName, objectKey)
 		if err != nil {
 			log.Printf("Error getting object reader: %v", err)
@@ -577,13 +576,32 @@ func (s *objStoreServer) handleObjectCmds(w http.ResponseWriter, r *http.Request
 		}
 		defer reader.Close()
 
-		// Copy the data to the response writer
-		_, err = io.Copy(w, reader)
+		// Seek to start position
+		_, err = reader.Seek(start, io.SeekStart)
 		if err != nil {
-			log.Printf("Error streaming object data: %v", err)
+			log.Printf("Error seeking in file: %v", err)
+			s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
+			return
 		}
 
+		// Read and send the data
+		buf := make([]byte, readSize)
+		n, err := io.ReadFull(reader, buf)
+		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+			log.Printf("Error reading file: %v", err)
+			s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
+			return
+		}
+
+		_, err = w.Write(buf[:n])
+		if err != nil {
+			log.Printf("Error writing response: %v", err)
+			return
+		}
+
+		log.Printf("Successfully streamed object %s/%s, bytes %d-%d", bucketName, objectKey, start, end)
 		return
+
 	case "PUT":
 		if isDir {
 			s.createDirectoriesAll(bucketName, objectKey)
@@ -1420,11 +1438,11 @@ func (s *objStoreServer) handleHeadObject(w http.ResponseWriter, r *http.Request
 	w.Header().Set("x-amz-request-id", generateUniqueID())     // Implement this function
 
 	// Log the headers for debugging
-	log.Printf("Headers for %v/%v: %v", metadata, objectKey, w.Header())
+	//log.Printf("Headers for %v/%v: %v", metadata, objectKey, w.Header())
 
 	w.WriteHeader(http.StatusOK)
-	log.Printf("Successfully responded to HEAD request: bucket=%s, key=%s, size=%d, isDirectory=%v",
-		bucketName, objectKey, metadata.Size, metadata.IsDirectory)
+	//log.Printf("Successfully responded to HEAD request: bucket=%s, key=%s, size=%d, isDirectory=%v",
+	//	bucketName, objectKey, metadata.Size, metadata.IsDirectory)
 }
 func (s *objStoreServer) handleHeadCmdBucket(w http.ResponseWriter, r *http.Request, bucketName string) error {
 	path := filepath.Join(s.dataDir, bucketName)
