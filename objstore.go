@@ -786,35 +786,25 @@ func main() {
 			// Define routes
 
 			r.HandleFunc("/", objStoreServer.handleRoot).Methods("GET")
-
 			r.HandleFunc("/{bucket}", objStoreServer.handlePutBucketReplication).
 				Methods("PUT", "GET", "DELETE").
 				Queries("replication", "")
-
 			r.HandleFunc("/{bucket}/", objStoreServer.handleBucketCmdsLocation).
 				Methods("GET").
 				Queries("location", "")
-
 			r.HandleFunc("/{bucket}", objStoreServer.handleBucketCmds).Methods("HEAD", "GET", "PUT", "DELETE")
-
 			r.HandleFunc("/{bucket}/", objStoreServer.handleBucketCmds).Methods("HEAD", "GET", "PUT", "DELETE")
-
 			r.HandleFunc("/{bucket}/{object:.+}", objStoreServer.handleNewMultipartUpload).
 				Methods("POST").
 				Queries("uploads", "")
-
 			r.HandleFunc("/{bucket}/{object:.+}", objStoreServer.handleUploadPart).
 				Methods("PUT").
 				Queries("partNumber", "{partNumber:[0-9]+}", "uploadId", "{uploadId}")
-
 			r.HandleFunc("/{bucket}/{object:.+}", objStoreServer.handleCompleteMultipartUpload).
 				Methods("POST").
 				Queries("uploadId", "{uploadId}")
-
 			r.HandleFunc("/{bucket}/{object:.+}", objStoreServer.handleObjectCmds).Methods("GET", "PUT", "DELETE", "HEAD")
-
 			r.HandleFunc("/{bucket}/{object:.+}/", objStoreServer.handleObjectCmds).Methods("GET", "PUT", "DELETE", "HEAD")
-
 			r.HandleFunc("/{bucket}/acl", objStoreServer.BucketACLHandler).Methods("GET", "PUT")
 
 			// Add logging middleware
