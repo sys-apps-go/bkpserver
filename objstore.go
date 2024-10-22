@@ -152,16 +152,17 @@ type MetadataIndex struct {
 }
 
 type objStoreServer struct {
-	storage            StorageBackend
-	dataDir            string
-	dataDirReplica     string
-	fileSystemReplName string
-	bucketNames        map[string]bool
-	multipartUploads   sync.Map
-	replicationManager *ReplicationManager
-	metadataIndex      map[string]MetadataIndex
-	bucketReplication  map[string]string
-	mu                 sync.Mutex
+	storage                 StorageBackend
+	dataDir                 string
+	dataDirReplica          string
+	fileSystemReplName      string
+	bucketNames             map[string]bool
+	multipartUploads        sync.Map
+	replicationManager      *ReplicationManager
+	metadataIndex           map[string]MetadataIndex
+	bucketReplication       map[string]string
+	bucketReplicationConfig map[string]ReplicationConfig
+	mu                      sync.Mutex
 }
 
 type ReplicationManager struct {
@@ -243,12 +244,13 @@ func newLiteObjectStoreServer(primaryFs, replicaFs string) *objStoreServer {
 		os.Exit(1)
 	}
 	s := &objStoreServer{
-		dataDir:            primaryFs,
-		dataDirReplica:     replicaFs,
-		replicationManager: NewReplicationManager(),
-		bucketNames:        make(map[string]bool),
-		metadataIndex:      make(map[string]MetadataIndex),
-		bucketReplication:  make(map[string]string),
+		dataDir:                 primaryFs,
+		dataDirReplica:          replicaFs,
+		replicationManager:      NewReplicationManager(),
+		bucketNames:             make(map[string]bool),
+		metadataIndex:           make(map[string]MetadataIndex),
+		bucketReplication:       make(map[string]string),
+		bucketReplicationConfig: make(map[string]ReplicationConfig),
 	}
 	return s
 }
@@ -486,6 +488,11 @@ func (s *objStoreServer) handleBucketCmds(w http.ResponseWriter, r *http.Request
 				return
 			}
 		}
+
+		s.mu.Lock()
+		s.bucketNames[bucketName] = true
+		s.mu.Unlock()
+
 		// Add to replication manager
 		w.WriteHeader(http.StatusOK)
 		w.Header().Set("Location", "/"+bucketName)
@@ -772,26 +779,35 @@ func main() {
 			// Define routes
 
 			r.HandleFunc("/", objStoreServer.handleRoot).Methods("GET")
+
+			r.HandleFunc("/{bucket}", objStoreServer.handlePutBucketReplication).
+				Methods("PUT", "GET").
+				Queries("replication", "")
+
 			r.HandleFunc("/{bucket}/", objStoreServer.handleBucketCmdsLocation).
 				Methods("GET").
 				Queries("location", "")
+
 			r.HandleFunc("/{bucket}", objStoreServer.handleBucketCmds).Methods("HEAD", "GET", "PUT", "DELETE")
+
 			r.HandleFunc("/{bucket}/", objStoreServer.handleBucketCmds).Methods("HEAD", "GET", "PUT", "DELETE")
 
 			r.HandleFunc("/{bucket}/{object:.+}", objStoreServer.handleNewMultipartUpload).
 				Methods("POST").
 				Queries("uploads", "")
+
 			r.HandleFunc("/{bucket}/{object:.+}", objStoreServer.handleUploadPart).
 				Methods("PUT").
 				Queries("partNumber", "{partNumber:[0-9]+}", "uploadId", "{uploadId}")
+
 			r.HandleFunc("/{bucket}/{object:.+}", objStoreServer.handleCompleteMultipartUpload).
 				Methods("POST").
 				Queries("uploadId", "{uploadId}")
+
 			r.HandleFunc("/{bucket}/{object:.+}", objStoreServer.handleObjectCmds).Methods("GET", "PUT", "DELETE", "HEAD")
+
 			r.HandleFunc("/{bucket}/{object:.+}/", objStoreServer.handleObjectCmds).Methods("GET", "PUT", "DELETE", "HEAD")
-			r.HandleFunc("/{bucket}", objStoreServer.handlePutBucketReplication).
-				Methods("PUT").
-				Queries("replication", "")
+
 			r.HandleFunc("/{bucket}/acl", objStoreServer.BucketACLHandler).Methods("GET", "PUT")
 
 			// Add logging middleware
@@ -1424,6 +1440,7 @@ func (s *objStoreServer) handleHeadObject(w http.ResponseWriter, r *http.Request
 	//log.Printf("Successfully responded to HEAD request: bucket=%s, key=%s, size=%d, isDirectory=%v",
 	//	bucketName, objectKey, metadata.Size, metadata.IsDirectory)
 }
+
 func (s *objStoreServer) handleHeadCmdBucket(w http.ResponseWriter, r *http.Request, bucketName string) error {
 	path := filepath.Join(s.dataDir, bucketName)
 	info, err := os.Stat(path)
@@ -2579,18 +2596,22 @@ func parseRange(rangeHeader string, size int64) (int64, int64, error) {
 	if !strings.HasPrefix(rangeHeader, "bytes=") {
 		return 0, 0, fmt.Errorf("invalid range header format")
 	}
+
 	parts := strings.Split(strings.TrimPrefix(rangeHeader, "bytes="), "-")
 	if len(parts) != 2 {
 		return 0, 0, fmt.Errorf("invalid range header format")
 	}
+
 	start, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil {
 		return 0, 0, fmt.Errorf("invalid start range")
 	}
+
 	end, err := strconv.ParseInt(parts[1], 10, 64)
 	if err != nil {
 		end = size - 1
 	}
+
 	if start > end || start < 0 || end >= size {
 		return 0, 0, fmt.Errorf("invalid range")
 	}
@@ -2599,6 +2620,7 @@ func parseRange(rangeHeader string, size int64) (int64, int64, error) {
 
 func (s *objStoreServer) GetObjectReader(bucketName, objectKey string) (io.ReadSeekCloser, error) {
 	filePath := filepath.Join(s.dataDir, bucketName, objectKey)
+
 	file, err := os.Open(filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -2606,44 +2628,62 @@ func (s *objStoreServer) GetObjectReader(bucketName, objectKey string) (io.ReadS
 		}
 		return nil, err
 	}
+
 	return file, nil
 }
 
 func (s *objStoreServer) handlePutBucketReplication(w http.ResponseWriter, r *http.Request) {
 	bucketName := mux.Vars(r)["bucket"]
-	if !isValidBucketName(bucketName) {
-		s.sendErrorResponse(w, "InvalidBucketName", http.StatusBadRequest)
-		return
-	}
 
-	// Check if the bucket exists
+	// 1. Check bucket exists
+	s.mu.Lock()
 	if _, exists := s.bucketNames[bucketName]; !exists {
 		s.sendErrorResponse(w, "NoSuchBucket", http.StatusNotFound)
+		s.mu.Unlock()
 		return
 	}
-
-	replicationConfig, err := parseReplicationConfig(r.Body)
-	if err != nil {
-		s.sendErrorResponse(w, "InvalidReplicationConfigurationXML", http.StatusBadRequest)
-		return
-	}
-
-	// Serialize the replicationConfig to JSON
-	replicationConfigJSON, err := json.Marshal(replicationConfig)
-	if err != nil {
-		s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
-		return
-	}
-
-	// Store the JSON string instead of the struct
-	s.mu.Lock()
-	s.bucketReplication[bucketName] = string(replicationConfigJSON)
-	s.bucketNames[bucketName] = true
 	s.mu.Unlock()
 
-	// Send success response
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Replication configuration applied successfully"))
+	switch r.Method {
+	case "GET":
+		s.handleGetBucketReplication(w, r, bucketName)
+
+	case "PUT":
+		// 2. Parse Replication configuration file
+		replicationConfig, err := parseReplicationConfig(r.Body)
+		if err != nil {
+			s.sendErrorResponse(w, "InvalidReplicationConfigurationXML", http.StatusBadRequest)
+			return
+		}
+
+		// 3. Get the replication config data
+		replicationConfigJSON, err := json.Marshal(replicationConfig)
+		if err != nil {
+			s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
+			return
+		}
+
+		// 4. Get the replication bucket name
+		bucketReplName, err := getBucketReplicateName(string(replicationConfigJSON))
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			return
+		}
+
+		// 5. Store the replication bucket name
+		s.mu.Lock()
+		s.bucketReplication[bucketName] = bucketReplName
+		s.bucketNames[bucketName] = true
+		s.bucketReplicationConfig[bucketName] = replicationConfig
+		s.mu.Unlock()
+
+		// 6. Create replica bucket
+		s.CreateBucketReplica(bucketReplName)
+
+		// 7. Send success response
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("Replication configuration applied successfully"))
+	}
 }
 
 type ReplicationConfig struct {
@@ -2663,12 +2703,195 @@ type ReplicationConfig struct {
 	} `json:"Rules"`
 }
 
+type XMLReplicationConfiguration struct {
+	XMLName xml.Name `xml:"ReplicationConfiguration"`
+	Role    string   `xml:"Role"`
+	Rules   []struct {
+		Status                  string `xml:"Status"`
+		Priority                int    `xml:"Priority"`
+		DeleteMarkerReplication struct {
+			Status string `xml:"Status"`
+		} `xml:"DeleteMarkerReplication"`
+		Filter struct {
+			Prefix string `xml:"Prefix"`
+		} `xml:"Filter"`
+		Destination struct {
+			Bucket string `xml:"Bucket"`
+		} `xml:"Destination"`
+	} `xml:"Rule"`
+}
+
 func parseReplicationConfig(body io.Reader) (ReplicationConfig, error) {
-	var config ReplicationConfig
-	decoder := json.NewDecoder(body)
-	err := decoder.Decode(&config)
+	// Read the entire body
+	bodyBytes, err := ioutil.ReadAll(body)
 	if err != nil {
-		return ReplicationConfig{}, err
+		return ReplicationConfig{}, fmt.Errorf("failed to read request body: %v", err)
+	}
+
+	var xmlConfig XMLReplicationConfiguration
+	err = xml.Unmarshal(bodyBytes, &xmlConfig)
+	if err != nil {
+		return ReplicationConfig{}, fmt.Errorf("failed to parse XML: %v", err)
+	}
+
+	// Convert XML config to ReplicationConfig
+	config := ReplicationConfig{
+		Role: xmlConfig.Role,
+		Rules: make([]struct {
+			Status                  string `json:"Status"`
+			Priority                int    `json:"Priority"`
+			DeleteMarkerReplication struct {
+				Status string `json:"Status"`
+			} `json:"DeleteMarkerReplication"`
+			Filter struct {
+				Prefix string `json:"Prefix"`
+			} `json:"Filter"`
+			Destination struct {
+				Bucket string `json:"Bucket"`
+			} `json:"Destination"`
+		}, len(xmlConfig.Rules)),
+	}
+
+	for i, rule := range xmlConfig.Rules {
+		config.Rules[i] = struct {
+			Status                  string `json:"Status"`
+			Priority                int    `json:"Priority"`
+			DeleteMarkerReplication struct {
+				Status string `json:"Status"`
+			} `json:"DeleteMarkerReplication"`
+			Filter struct {
+				Prefix string `json:"Prefix"`
+			} `json:"Filter"`
+			Destination struct {
+				Bucket string `json:"Bucket"`
+			} `json:"Destination"`
+		}{
+			Status:   rule.Status,
+			Priority: rule.Priority,
+			DeleteMarkerReplication: struct {
+				Status string `json:"Status"`
+			}{Status: rule.DeleteMarkerReplication.Status},
+			Filter: struct {
+				Prefix string `json:"Prefix"`
+			}{Prefix: rule.Filter.Prefix},
+			Destination: struct {
+				Bucket string `json:"Bucket"`
+			}{Bucket: rule.Destination.Bucket},
+		}
+	}
+
+	// Validate the parsed configuration
+	if config.Role == "" {
+		return ReplicationConfig{}, fmt.Errorf("Role is required in replication configuration")
+	}
+	if len(config.Rules) == 0 {
+		return ReplicationConfig{}, fmt.Errorf("At least one rule is required in replication configuration")
+	}
+	for i, rule := range config.Rules {
+		if rule.Status != "Enabled" && rule.Status != "Disabled" {
+			return ReplicationConfig{}, fmt.Errorf("Invalid Status for rule %d: must be 'Enabled' or 'Disabled'", i)
+		}
+		if rule.Destination.Bucket == "" {
+			return ReplicationConfig{}, fmt.Errorf("Destination Bucket is required for rule %d", i)
+		}
 	}
 	return config, nil
+}
+
+func getBucketReplicateName(jsonStr string) (string, error) {
+	var config struct {
+		Rules []struct {
+			Destination struct {
+				Bucket string `json:"Bucket"`
+			} `json:"Destination"`
+		} `json:"Rules"`
+	}
+
+	err := json.Unmarshal([]byte(jsonStr), &config)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse JSON: %v", err)
+	}
+
+	if len(config.Rules) == 0 {
+		return "", fmt.Errorf("no replication rules found")
+	}
+
+	bucketARN := config.Rules[0].Destination.Bucket
+	parts := strings.Split(bucketARN, ":")
+	if len(parts) < 6 {
+		return "", fmt.Errorf("invalid bucket ARN format")
+	}
+
+	bucketName := parts[5]
+	return bucketName, nil
+}
+
+func (s *objStoreServer) handleGetBucketReplication(w http.ResponseWriter, r *http.Request, bucketName string) {
+	s.mu.Lock()
+	replicationConfig, exists := s.bucketReplicationConfig[bucketName]
+	s.mu.Unlock()
+
+	if !exists {
+		s.sendErrorResponse(w, "ReplicationConfigurationNotFoundError", http.StatusNotFound)
+		return
+	}
+
+	// Convert the replication configuration to XML
+	xmlConfig := XMLReplicationConfiguration{
+		Role: replicationConfig.Role,
+		Rules: make([]struct {
+			Status                  string `xml:"Status"`
+			Priority                int    `xml:"Priority"`
+			DeleteMarkerReplication struct {
+				Status string `xml:"Status"`
+			} `xml:"DeleteMarkerReplication"`
+			Filter struct {
+				Prefix string `xml:"Prefix"`
+			} `xml:"Filter"`
+			Destination struct {
+				Bucket string `xml:"Bucket"`
+			} `xml:"Destination"`
+		}, len(replicationConfig.Rules)),
+	}
+
+	for i, rule := range replicationConfig.Rules {
+		xmlConfig.Rules[i] = struct {
+			Status                  string `xml:"Status"`
+			Priority                int    `xml:"Priority"`
+			DeleteMarkerReplication struct {
+				Status string `xml:"Status"`
+			} `xml:"DeleteMarkerReplication"`
+			Filter struct {
+				Prefix string `xml:"Prefix"`
+			} `xml:"Filter"`
+			Destination struct {
+				Bucket string `xml:"Bucket"`
+			} `xml:"Destination"`
+		}{
+			Status:   rule.Status,
+			Priority: rule.Priority,
+			DeleteMarkerReplication: struct {
+				Status string `xml:"Status"`
+			}{Status: rule.DeleteMarkerReplication.Status},
+			Filter: struct {
+				Prefix string `xml:"Prefix"`
+			}{Prefix: rule.Filter.Prefix},
+			Destination: struct {
+				Bucket string `xml:"Bucket"`
+			}{Bucket: rule.Destination.Bucket},
+		}
+	}
+
+	// Marshal the XML configuration
+	output, err := xml.MarshalIndent(xmlConfig, "", "  ")
+	if err != nil {
+		s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
+		return
+	}
+
+	// Set the content type to XML and write the response
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(xml.Header))
+	w.Write(output)
 }
