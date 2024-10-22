@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/gorilla/mux"
 	"github.com/urfave/cli/v2"
 )
@@ -67,6 +68,14 @@ type ObjectInfo struct {
 	ETag         string
 	ContentType  string
 	Metadata     map[string]string
+}
+
+type SyncManager struct {
+	watcher       *fsnotify.Watcher
+	watchedPaths  map[string]bool
+	mu            sync.Mutex
+	syncInterval  time.Duration
+	lastSyncTimes map[string]time.Time
 }
 
 type APIError struct {
@@ -162,6 +171,7 @@ type objStoreServer struct {
 	metadataIndex           map[string]MetadataIndex
 	bucketReplication       map[string]string
 	bucketReplicationConfig map[string]ReplicationConfig
+	syncManager             *SyncManager
 	mu                      sync.Mutex
 }
 
@@ -258,6 +268,11 @@ func newLiteObjectStoreServer(primaryFs, replicaFs string) *objStoreServer {
 		metadataIndex:           make(map[string]MetadataIndex),
 		bucketReplication:       make(map[string]string),
 		bucketReplicationConfig: make(map[string]ReplicationConfig),
+	}
+	s.syncManager, err = NewSyncManager(5 * time.Second)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
 	}
 	return s
 }
@@ -792,6 +807,9 @@ func main() {
 			r.HandleFunc("/{bucket}/", objStoreServer.handleBucketCmdsLocation).
 				Methods("GET").
 				Queries("location", "")
+			//r.HandleFunc("/{bucket}", objStoreServer.handleSyncRequest).
+			//	Methods("POST").
+			//	Queries("sync", "true", "file", "{file}")
 			r.HandleFunc("/{bucket}", objStoreServer.handleBucketCmds).Methods("HEAD", "GET", "PUT", "DELETE")
 			r.HandleFunc("/{bucket}/", objStoreServer.handleBucketCmds).Methods("HEAD", "GET", "PUT", "DELETE")
 			r.HandleFunc("/{bucket}/{object:.+}", objStoreServer.handleNewMultipartUpload).
@@ -1202,7 +1220,7 @@ func (s *objStoreServer) handleCompleteMultipartUpload(w http.ResponseWriter, r 
 		return
 	}
 
-	err := s.CompleteMultipartUpload(bucketName, objectKey, uploadID, completeMultipartUpload.Parts)
+	err := s.CompleteMultipartUpload(bucketName, objectKey, uploadID, completeMultipartUpload.Parts, r)
 	if err != nil {
 		s.sendErrorResponse(w, "InternalError", http.StatusInternalServerError)
 		return
@@ -1236,7 +1254,7 @@ func (s *objStoreServer) PutObjectPart(bucket, key, uploadID string, partNumber 
 	return nil
 }
 
-func (s *objStoreServer) CompleteMultipartUpload(bucket, key, uploadID string, parts []CompletedPart) error {
+func (s *objStoreServer) CompleteMultipartUpload(bucket, key, uploadID string, parts []CompletedPart, r *http.Request) error {
 	uploadDir := filepath.Join(s.dataDir, bucket, fmt.Sprintf("%s.%s", key, uploadID))
 	finalPath := filepath.Join(s.dataDir, bucket, key)
 
@@ -1271,9 +1289,15 @@ func (s *objStoreServer) CompleteMultipartUpload(bucket, key, uploadID string, p
 	controlFilePath := filepath.Join(filepath.Dir(finalPath), controlFileName)
 
 	metadata := map[string]string{
-		"UploadID": uploadID,
-		"Parts":    fmt.Sprintf("%d", len(parts)),
-		// Add any other metadata you want to store
+		"CreatedAt": time.Now().UTC().Format(time.RFC3339),
+		"Path":      controlFilePath,
+		"UploadID":  uploadID,
+		"Parts":     fmt.Sprintf("%d", len(parts)),
+	}
+
+	m := extractMetadata(r.Header)
+	for key, value := range m {
+		metadata[key] = value
 	}
 
 	metadataJSON, err := json.Marshal(metadata)
@@ -2903,4 +2927,97 @@ func (s *objStoreServer) handleGetBucketReplication(w http.ResponseWriter, r *ht
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(xml.Header))
 	w.Write(output)
+}
+
+func NewSyncManager(syncInterval time.Duration) (*SyncManager, error) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return nil, err
+	}
+
+	return &SyncManager{
+		watcher:       watcher,
+		watchedPaths:  make(map[string]bool),
+		syncInterval:  syncInterval,
+		lastSyncTimes: make(map[string]time.Time),
+	}, nil
+}
+
+func (sm *SyncManager) AddPath(path string) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if sm.watchedPaths[path] {
+		return nil // Already watching this path
+	}
+
+	err := sm.watcher.Add(path)
+	if err != nil {
+		return err
+	}
+
+	sm.watchedPaths[path] = true
+	sm.lastSyncTimes[path] = time.Now()
+
+	go sm.monitorPath(path)
+	return nil
+}
+
+func (sm *SyncManager) monitorPath(path string) {
+	for {
+		select {
+		case event, ok := <-sm.watcher.Events:
+			if !ok {
+				return
+			}
+			if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) || event.Has(fsnotify.Remove) {
+				sm.handleFileChange(event.Name)
+			}
+		case err, ok := <-sm.watcher.Errors:
+			if !ok {
+				return
+			}
+			log.Println("error:", err)
+		}
+	}
+}
+
+func (sm *SyncManager) handleFileChange(path string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	lastSync, exists := sm.lastSyncTimes[path]
+	if !exists || time.Since(lastSync) > sm.syncInterval {
+		sm.syncFile(path)
+		sm.lastSyncTimes[path] = time.Now()
+	}
+}
+
+func (sm *SyncManager) syncFile(path string) {
+	// Implement your S3 sync logic here
+	// This could involve uploading the file to S3, updating metadata, etc.
+	fmt.Printf("Syncing file: %s\n", path)
+	// Example: uploadToS3(path)
+}
+
+// In your main server code:
+func (s *objStoreServer) handleSyncRequest(w http.ResponseWriter, r *http.Request) {
+	bucketName := mux.Vars(r)["bucket"]
+	fileName := r.URL.Query().Get("file")
+
+	if bucketName == "" || fileName == "" {
+		http.Error(w, "Missing bucket or file parameter", http.StatusBadRequest)
+		return
+	}
+
+	localPath := filepath.Join(s.dataDir, bucketName, fileName)
+
+	err := s.syncManager.AddPath(localPath)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to set up sync: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "Sync initiated for %s/%s", bucketName, fileName)
 }
