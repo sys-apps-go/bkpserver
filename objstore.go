@@ -837,11 +837,8 @@ func main() {
 				Methods("GET").
 				Queries("listen", "")
 
-			/*
 			r.HandleFunc("/{bucket}", objStoreServer.handleGetBucketObjectLock).Methods("GET").Queries("object-lock", "")
-			r.HandleFunc("/{bucket}", objStoreServer.handlePutBucketObjectLock).Methods("PUT").Queries("object-lock", "")
-			r.HandleFunc("/{bucket}/{key:.+}", objStoreServer.handleObjectOperation).Methods("PUT", "DELETE")
-			*/
+			r.HandleFunc("/{bucket}", objStoreServer.handlePutBucketObjectLock).Methods("PUT").Queries("object-lock", "") 
 
 			r.HandleFunc("/{bucket}", objStoreServer.handleBucketCmds).Methods("HEAD", "GET", "PUT", "DELETE")
 			r.HandleFunc("/{bucket}/", objStoreServer.handleBucketCmds).Methods("HEAD", "GET", "PUT", "DELETE")
@@ -878,7 +875,7 @@ func main() {
 
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		//log.Printf("Received request: %s %s", r.Method, r.URL)
+		log.Printf("Received request: %s %s", r.Method, r.URL)
 		next.ServeHTTP(w, r)
 	})
 }
@@ -3289,11 +3286,13 @@ func (s *objStoreServer) handleGetBucketObjectLock(w http.ResponseWriter, r *htt
 	s.objectLockMutex.RUnlock()
 
 	if !exists {
-		http.Error(w, "Object lock configuration not found", http.StatusNotFound)
+		w.WriteHeader(http.StatusOK)
+		//http.Error(w, "Object lock configuration not found", http.StatusNotFound)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(http.StatusOK)
 	encoder := xml.NewEncoder(w)
 	if err := encoder.Encode(lockConfig); err != nil {
 		http.Error(w, "Error encoding response", http.StatusInternalServerError)
