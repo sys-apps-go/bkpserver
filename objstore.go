@@ -78,6 +78,22 @@ type SyncManager struct {
 	lastSyncTimes map[string]time.Time
 }
 
+type ObjectLockConfiguration struct {
+	XMLName           xml.Name `xml:"ObjectLockConfiguration"`
+	ObjectLockEnabled string   `xml:"ObjectLockEnabled"`
+	Rule              *Rule    `xml:"Rule,omitempty"`
+}
+
+type Rule struct {
+	DefaultRetention *DefaultRetention `xml:"DefaultRetention"`
+}
+
+type DefaultRetention struct {
+	Mode  string `xml:"Mode"`
+	Days  int    `xml:"Days,omitempty"`
+	Years int    `xml:"Years,omitempty"`
+}
+
 type APIError struct {
 	Code           string
 	Description    string
@@ -174,6 +190,10 @@ type objStoreServer struct {
 	bucketReplicationConfig map[string]ReplicationConfig
 	syncManager             *SyncManager
 	mu                      sync.Mutex
+	objectLocks     map[string]*ObjectLockConfiguration
+	objectLockMutex sync.RWMutex
+	objectMutexes   map[string]*sync.Mutex
+	objectMutexLock sync.Mutex
 }
 
 type ReplicationManager struct {
@@ -269,6 +289,8 @@ func newLiteObjectStoreServer(primaryFs, replicaFs string) *objStoreServer {
 		metadataIndex:           make(map[string]MetadataIndex),
 		bucketReplication:       make(map[string]string),
 		bucketReplicationConfig: make(map[string]ReplicationConfig),
+		objectLocks:   make(map[string]*ObjectLockConfiguration),
+		objectMutexes: make(map[string]*sync.Mutex),
 	}
 	s.syncManager, err = NewSyncManager(5 * time.Second)
 	if err != nil {
@@ -815,9 +837,12 @@ func main() {
 				Methods("GET").
 				Queries("listen", "")
 
-			//r.HandleFunc("/{bucket}", objStoreServer.handleSyncRequest).
-			//	Methods("POST").
-			//	Queries("sync", "true", "file", "{file}")
+			/*
+			r.HandleFunc("/{bucket}", objStoreServer.handleGetBucketObjectLock).Methods("GET").Queries("object-lock", "")
+			r.HandleFunc("/{bucket}", objStoreServer.handlePutBucketObjectLock).Methods("PUT").Queries("object-lock", "")
+			r.HandleFunc("/{bucket}/{key:.+}", objStoreServer.handleObjectOperation).Methods("PUT", "DELETE")
+			*/
+
 			r.HandleFunc("/{bucket}", objStoreServer.handleBucketCmds).Methods("HEAD", "GET", "PUT", "DELETE")
 			r.HandleFunc("/{bucket}/", objStoreServer.handleBucketCmds).Methods("HEAD", "GET", "PUT", "DELETE")
 			r.HandleFunc("/{bucket}/{object:.+}", objStoreServer.handleNewMultipartUpload).
@@ -853,7 +878,7 @@ func main() {
 
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("Received request: %s %s", r.Method, r.URL)
+		//log.Printf("Received request: %s %s", r.Method, r.URL)
 		next.ServeHTTP(w, r)
 	})
 }
@@ -1014,7 +1039,6 @@ func (s *objStoreServer) PutObject(bucket, key string, data []byte, metadata map
 	if err := ioutil.WriteFile(fullPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write file: %v", err)
 	}
-
 	s.mu.Lock()
 	replicaBucket, exists := s.bucketReplication[bucket]
 	s.mu.Unlock()
@@ -3253,5 +3277,131 @@ func (s *objStoreServer) listenBucketEvents(w http.ResponseWriter, r *http.Reque
 			// Client disconnected
 			return
 		}
+	}
+}
+
+func (s *objStoreServer) handleGetBucketObjectLock(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	bucketName := vars["bucket"]
+
+	s.objectLockMutex.RLock()
+	lockConfig, exists := s.objectLocks[bucketName]
+	s.objectLockMutex.RUnlock()
+
+	if !exists {
+		http.Error(w, "Object lock configuration not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/xml")
+	encoder := xml.NewEncoder(w)
+	if err := encoder.Encode(lockConfig); err != nil {
+		http.Error(w, "Error encoding response", http.StatusInternalServerError)
+		return
+	}
+}
+
+func (s *objStoreServer) handlePutBucketObjectLock(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	bucketName := vars["bucket"]
+
+	var config ObjectLockConfiguration
+	if err := xml.NewDecoder(r.Body).Decode(&config); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.validateObjectLockConfig(&config); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	s.objectLockMutex.Lock()
+	s.objectLocks[bucketName] = &config
+	s.objectLockMutex.Unlock()
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *objStoreServer) validateObjectLockConfig(config *ObjectLockConfiguration) error {
+	if config.ObjectLockEnabled != "Enabled" {
+		return fmt.Errorf("ObjectLockEnabled must be 'Enabled'")
+	}
+	if config.Rule != nil && config.Rule.DefaultRetention != nil {
+		if config.Rule.DefaultRetention.Mode != "GOVERNANCE" && config.Rule.DefaultRetention.Mode != "COMPLIANCE" {
+			return fmt.Errorf("Invalid retention mode")
+		}
+		if (config.Rule.DefaultRetention.Days > 0 && config.Rule.DefaultRetention.Years > 0) ||
+			(config.Rule.DefaultRetention.Days == 0 && config.Rule.DefaultRetention.Years == 0) {
+			return fmt.Errorf("Either Days or Years must be set, not both")
+		}
+	}
+	return nil
+}
+
+func (s *objStoreServer) getObjectMutex(objectKey string) *sync.Mutex {
+	s.objectMutexLock.Lock()
+	defer s.objectMutexLock.Unlock()
+
+	if _, exists := s.objectMutexes[objectKey]; !exists {
+		s.objectMutexes[objectKey] = &sync.Mutex{}
+	}
+	return s.objectMutexes[objectKey]
+}
+
+func (s *objStoreServer) handleObjectOperation(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	bucketName := vars["bucket"]
+	objectKey := vars["key"]
+
+	s.objectLockMutex.RLock()
+	lockConfig, exists := s.objectLocks[bucketName]
+	s.objectLockMutex.RUnlock()
+
+	if exists && lockConfig.ObjectLockEnabled == "Enabled" {
+		// Check if the object is locked
+		if s.isObjectLocked(bucketName, objectKey) {
+			http.Error(w, "Object is locked", http.StatusForbidden)
+			return
+		}
+	}
+
+	// Get the mutex for this object
+	objectMutex := s.getObjectMutex(objectKey)
+	objectMutex.Lock()
+	defer objectMutex.Unlock()
+
+	// Perform the object operation (e.g., copy, delete)
+	s.performObjectOperation(w, r, bucketName, objectKey)
+}
+
+func (s *objStoreServer) isObjectLocked(bucketName, objectKey string) bool {
+	// Implement logic to check if the object is locked
+	// This could involve checking a database or in-memory store for the object's lock status
+	return false // Placeholder
+}
+
+func (s *objStoreServer) performObjectOperation(w http.ResponseWriter, r *http.Request, bucketName, objectKey string) {
+	// Implement the actual object operation (e.g., copy, delete)
+	// For example, for a copy operation:
+	if r.Method == http.MethodPut {
+		destPath := fmt.Sprintf("/tmp/%s-%s", bucketName, objectKey)
+		destFile, err := os.Create(destPath)
+		if err != nil {
+			http.Error(w, "Failed to create destination file", http.StatusInternalServerError)
+			return
+		}
+		defer destFile.Close()
+
+		_, err = io.Copy(destFile, r.Body)
+		if err != nil {
+			http.Error(w, "Failed to copy object", http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "Object copied successfully")
+	} else {
+		http.Error(w, "Method not supported", http.StatusMethodNotAllowed)
 	}
 }
