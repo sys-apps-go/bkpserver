@@ -148,6 +148,7 @@ type ErrorResponse struct {
 type Bucket struct {
 	Name         string
 	CreationDate time.Time
+	Events       []Event
 }
 
 type ObjectACL struct {
@@ -807,6 +808,13 @@ func main() {
 			r.HandleFunc("/{bucket}/", objStoreServer.handleBucketCmdsLocation).
 				Methods("GET").
 				Queries("location", "")
+			r.HandleFunc("/{bucket}", objStoreServer.handleBucketEventNotification).
+				Methods("PUT", "GET", "DELETE").
+				Queries("notification", "")
+			r.HandleFunc("/{bucket}/events", objStoreServer.listenBucketEvents).
+				Methods("GET").
+				Queries("listen", "")
+
 			//r.HandleFunc("/{bucket}", objStoreServer.handleSyncRequest).
 			//	Methods("POST").
 			//	Queries("sync", "true", "file", "{file}")
@@ -3020,4 +3028,230 @@ func (s *objStoreServer) handleSyncRequest(w http.ResponseWriter, r *http.Reques
 
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "Sync initiated for %s/%s", bucketName, fileName)
+}
+
+type Event struct {
+	Type string `json:"type"`
+	// Add other event properties as needed
+}
+
+var (
+	buckets = make(map[string]*Bucket)
+	mu      sync.RWMutex
+)
+
+// SetEvent handler
+func SetEvent(w http.ResponseWriter, r *http.Request) {
+	bucketName := r.URL.Query().Get("bucket")
+	if bucketName == "" {
+		http.Error(w, "Bucket name is required", http.StatusBadRequest)
+		return
+	}
+
+	var event Event
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		http.Error(w, "Invalid event data", http.StatusBadRequest)
+		return
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	bucket, exists := buckets[bucketName]
+	if !exists {
+		bucket = &Bucket{Name: bucketName}
+		buckets[bucketName] = bucket
+	}
+
+	bucket.Events = append(bucket.Events, event)
+
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]string{"message": "Event set successfully"})
+}
+
+// GetEventList handler
+func GetEventList(w http.ResponseWriter, r *http.Request) {
+	bucketName := r.URL.Query().Get("bucket")
+	if bucketName == "" {
+		http.Error(w, "Bucket name is required", http.StatusBadRequest)
+		return
+	}
+
+	mu.RLock()
+	defer mu.RUnlock()
+
+	bucket, exists := buckets[bucketName]
+	if !exists {
+		http.Error(w, "Bucket not found", http.StatusNotFound)
+		return
+	}
+
+	json.NewEncoder(w).Encode(bucket.Events)
+}
+
+// RemoveEvent handler
+func RemoveEvent(w http.ResponseWriter, r *http.Request) {
+	bucketName := r.URL.Query().Get("bucket")
+	eventType := r.URL.Query().Get("type")
+	if bucketName == "" || eventType == "" {
+		http.Error(w, "Bucket name and event type are required", http.StatusBadRequest)
+		return
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	bucket, exists := buckets[bucketName]
+	if !exists {
+		http.Error(w, "Bucket not found", http.StatusNotFound)
+		return
+	}
+
+	for i, event := range bucket.Events {
+		if event.Type == eventType {
+			bucket.Events = append(bucket.Events[:i], bucket.Events[i+1:]...)
+			break
+		}
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"message": "Event removed successfully"})
+}
+
+// ListenEvent handler (this is a simplified example using Server-Sent Events)
+func ListenEvent(w http.ResponseWriter, r *http.Request) {
+	bucketName := r.URL.Query().Get("bucket")
+	if bucketName == "" {
+		http.Error(w, "Bucket name is required", http.StatusBadRequest)
+		return
+	}
+
+	// Set headers for SSE
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	// Create a channel for new events
+	eventChan := make(chan Event)
+
+	// Start a goroutine to listen for new events
+	go func() {
+		for {
+			mu.RLock()
+			bucket, exists := buckets[bucketName]
+			if exists && len(bucket.Events) > 0 {
+				event := bucket.Events[len(bucket.Events)-1]
+				eventChan <- event
+			}
+			mu.RUnlock()
+			// Sleep to avoid tight looping
+			time.Sleep(1 * time.Second)
+		}
+	}()
+
+	// Write events to the response
+	for event := range eventChan {
+		data, _ := json.Marshal(event)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		w.(http.Flusher).Flush()
+	}
+}
+
+type ObjectStoreServer struct {
+	// Add any necessary fields for your server
+}
+
+type EventNotification struct {
+	Events []string `json:"Events"`
+	// Add other fields as needed, such as ARN for SNS/SQS, etc.
+}
+
+func (s *ObjectStoreServer) handleRoot(w http.ResponseWriter, r *http.Request) {
+	// Handle the root path "/"
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Welcome to the Object Store Server"))
+}
+
+func (s *objStoreServer) handleBucketEventNotification(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	bucketName := vars["bucket"]
+
+	switch r.Method {
+	case "PUT":
+		s.setBucketEventNotification(w, r, bucketName)
+	case "GET":
+		if r.URL.Query().Get("listen") != "" {
+			s.listenBucketEvents(w, r)
+		} else {
+			s.getBucketEventNotification(w, r, bucketName)
+		}
+	case "DELETE":
+		s.deleteBucketEventNotification(w, r, bucketName)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *objStoreServer) setBucketEventNotification(w http.ResponseWriter, r *http.Request, bucketName string) {
+	var notification EventNotification
+	if err := json.NewDecoder(r.Body).Decode(&notification); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Implement logic to set the event notification for the bucket
+	// This might involve storing the configuration in a database or in-memory store
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"message": "Event notification set successfully"})
+}
+
+func (s *objStoreServer) getBucketEventNotification(w http.ResponseWriter, r *http.Request, bucketName string) {
+	// Implement logic to retrieve the event notification configuration for the bucket
+	// This might involve fetching from a database or in-memory store
+
+	// For this example, we'll use a dummy notification
+	notification := EventNotification{
+		Events: []string{"s3:ObjectCreated:*", "s3:ObjectRemoved:*"},
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(notification)
+}
+
+func (s *objStoreServer) deleteBucketEventNotification(w http.ResponseWriter, r *http.Request, bucketName string) {
+	// Implement logic to delete the event notification configuration for the bucket
+	// This might involve removing the configuration from a database or in-memory store
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"message": "Event notification deleted successfully"})
+}
+
+func (s *objStoreServer) listenBucketEvents(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	bucketName := vars["bucket"]
+
+	// Set headers for Server-Sent Events (SSE)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	// Create a channel for events
+	events := make(chan string)
+	fmt.Println("Listen on events: ", bucketName)
+	// In a real implementation, you would register this channel
+	// to receive events for the specified bucket
+
+	// Keep the connection open
+	for {
+		select {
+		case event := <-events:
+			// Send the event to the client
+			fmt.Fprintf(w, "data: %s\n\n", event)
+			w.(http.Flusher).Flush()
+		case <-r.Context().Done():
+			// Client disconnected
+			return
+		}
+	}
 }
