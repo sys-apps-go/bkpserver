@@ -190,10 +190,10 @@ type objStoreServer struct {
 	bucketReplicationConfig map[string]ReplicationConfig
 	syncManager             *SyncManager
 	mu                      sync.Mutex
-	objectLocks     map[string]*ObjectLockConfiguration
-	objectLockMutex sync.RWMutex
-	objectMutexes   map[string]*sync.Mutex
-	objectMutexLock sync.Mutex
+	objectLocks             map[string]*ObjectLockConfiguration
+	objectLockMutex         sync.RWMutex
+	objectMutexes           map[string]*sync.Mutex
+	objectMutexLock         sync.Mutex
 }
 
 type ReplicationManager struct {
@@ -289,8 +289,8 @@ func newLiteObjectStoreServer(primaryFs, replicaFs string) *objStoreServer {
 		metadataIndex:           make(map[string]MetadataIndex),
 		bucketReplication:       make(map[string]string),
 		bucketReplicationConfig: make(map[string]ReplicationConfig),
-		objectLocks:   make(map[string]*ObjectLockConfiguration),
-		objectMutexes: make(map[string]*sync.Mutex),
+		objectLocks:             make(map[string]*ObjectLockConfiguration),
+		objectMutexes:           make(map[string]*sync.Mutex),
 	}
 	s.syncManager, err = NewSyncManager(5 * time.Second)
 	if err != nil {
@@ -361,6 +361,8 @@ func (s *objStoreServer) handleRoot(w http.ResponseWriter, r *http.Request) {
 func (s *objStoreServer) handleBucketCmds(w http.ResponseWriter, r *http.Request) {
 	var objects []Object
 	var err error
+
+	//printHTTPHeader(r)
 
 	bucketName := mux.Vars(r)["bucket"]
 
@@ -564,6 +566,8 @@ func (s *objStoreServer) handleObjectCmds(w http.ResponseWriter, r *http.Request
 	vars := mux.Vars(r)
 	bucketName := vars["bucket"]
 	objectKey := vars["object"]
+
+	//printHTTPHeader(r)
 
 	if !s.BucketExists(bucketName) {
 		s.sendErrorResponse(w, "NoSuchBucket", http.StatusNotFound)
@@ -838,7 +842,7 @@ func main() {
 				Queries("listen", "")
 
 			r.HandleFunc("/{bucket}", objStoreServer.handleGetBucketObjectLock).Methods("GET").Queries("object-lock", "")
-			r.HandleFunc("/{bucket}", objStoreServer.handlePutBucketObjectLock).Methods("PUT").Queries("object-lock", "") 
+			r.HandleFunc("/{bucket}", objStoreServer.handlePutBucketObjectLock).Methods("PUT").Queries("object-lock", "")
 
 			r.HandleFunc("/{bucket}", objStoreServer.handleBucketCmds).Methods("HEAD", "GET", "PUT", "DELETE")
 			r.HandleFunc("/{bucket}/", objStoreServer.handleBucketCmds).Methods("HEAD", "GET", "PUT", "DELETE")
@@ -1813,6 +1817,9 @@ func (s *objStoreServer) deleteBucket(bucket string) error {
 			err = s.DeleteBucket(bucketPath)
 		}
 	}
+	s.mu.Lock()
+	delete(s.bucketNames, bucket)
+	s.mu.Unlock()
 	return err
 }
 
@@ -3285,9 +3292,8 @@ func (s *objStoreServer) handleGetBucketObjectLock(w http.ResponseWriter, r *htt
 	lockConfig, exists := s.objectLocks[bucketName]
 	s.objectLockMutex.RUnlock()
 
-	if !exists {
-		w.WriteHeader(http.StatusOK)
-		//http.Error(w, "Object lock configuration not found", http.StatusNotFound)
+	if exists {
+		http.Error(w, "Object lock configuration not found", http.StatusNotFound)
 		return
 	}
 
@@ -3403,4 +3409,177 @@ func (s *objStoreServer) performObjectOperation(w http.ResponseWriter, r *http.R
 	} else {
 		http.Error(w, "Method not supported", http.StatusMethodNotAllowed)
 	}
+}
+
+func printHTTPHeader(r *http.Request) {
+	fmt.Println("Headers received from client:")
+	for key, values := range r.Header {
+		for _, value := range values {
+			fmt.Printf("%s: %s\n", key, value)
+		}
+	}
+}
+
+// EnableVersioning enables versioning for a bucket
+func (s *objStoreServer) EnableVersioning(bucketName string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.BucketExists(bucketName) {
+		return fmt.Errorf("bucket %s does not exist", bucketName)
+	}
+
+	// Implement versioning logic here
+	// For simplicity, we'll just set a flag in the bucket metadata
+	bucketPath := filepath.Join(s.dataDir, bucketName)
+	versioningFlag := filepath.Join(bucketPath, ".versioning_enabled")
+	return ioutil.WriteFile(versioningFlag, []byte("true"), 0644)
+}
+
+// DisableVersioning disables versioning for a bucket
+func (s *objStoreServer) DisableVersioning(bucketName string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.BucketExists(bucketName) {
+		return fmt.Errorf("bucket %s does not exist", bucketName)
+	}
+
+	bucketPath := filepath.Join(s.dataDir, bucketName)
+	versioningFlag := filepath.Join(bucketPath, ".versioning_enabled")
+	return os.Remove(versioningFlag)
+}
+
+// CopyObject copies an object from one location to another
+func (s *objStoreServer) CopyObject(srcBucket, srcObject, dstBucket, dstObject string) error {
+	srcPath := filepath.Join(s.dataDir, srcBucket, srcObject)
+	dstPath := filepath.Join(s.dataDir, dstBucket, dstObject)
+
+	srcFile, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	dstFile, err := os.Create(dstPath)
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	_, err = io.Copy(dstFile, srcFile)
+	return err
+}
+
+// StatObject retrieves metadata about an object
+func (s *objStoreServer) StatObject(bucketName, objectName string) (*ObjectInfo, error) {
+	objectPath := filepath.Join(s.dataDir, bucketName, objectName)
+	info, err := os.Stat(objectPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return &ObjectInfo{
+		Key:          objectName,
+		Size:         info.Size(),
+		LastModified: info.ModTime(),
+		ETag:         fmt.Sprintf("\"%x\"", md5.Sum([]byte(objectPath))),
+		//contentType:  r.Header.Get("Content-Type"),
+	}, nil
+}
+
+// RemoveObjects removes multiple objects from a bucket
+func (s *objStoreServer) RemoveObjects(bucketName string, objectNames []string) error {
+	for _, objectName := range objectNames {
+		err := s.DeleteObject(bucketName, objectName)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// PresignedGetObject generates a presigned URL for GET operation
+func (s *objStoreServer) PresignedGetObject(bucketName, objectName string, expiry time.Duration) (string, error) {
+	if !s.BucketExists(bucketName) {
+		return "", fmt.Errorf("bucket %s does not exist", bucketName)
+	}
+
+	objectPath := filepath.Join(s.dataDir, bucketName, objectName)
+	if _, err := os.Stat(objectPath); os.IsNotExist(err) {
+		return "", fmt.Errorf("object %s does not exist", objectName)
+	}
+
+	// Generate a unique token
+	token := uuid.New().String()
+
+	// Create a signed URL
+	u, err := url.Parse(fmt.Sprintf("http://localhost:8080/%s/%s", bucketName, objectName))
+	if err != nil {
+		return "", err
+	}
+
+	q := u.Query()
+	q.Set("token", token)
+	q.Set("expires", strconv.FormatInt(time.Now().Add(expiry).Unix(), 10))
+	u.RawQuery = q.Encode()
+
+	// Store the token in memory (in a production environment, use a more persistent storage)
+	// Implementation of token storage is omitted for brevity
+
+	return u.String(), nil
+}
+
+// SetBucketPolicy sets the policy for a bucket
+func (s *objStoreServer) SetBucketPolicy(bucketName, policy string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.BucketExists(bucketName) {
+		return fmt.Errorf("bucket %s does not exist", bucketName)
+	}
+
+	policyPath := filepath.Join(s.dataDir, bucketName, ".bucket_policy")
+	return ioutil.WriteFile(policyPath, []byte(policy), 0644)
+}
+
+// GetBucketPolicy retrieves the policy for a bucket
+func (s *objStoreServer) GetBucketPolicy(bucketName string) (string, error) {
+	if !s.BucketExists(bucketName) {
+		return "", fmt.Errorf("bucket %s does not exist", bucketName)
+	}
+
+	policyPath := filepath.Join(s.dataDir, bucketName, ".bucket_policy")
+	policy, err := ioutil.ReadFile(policyPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil // No policy set
+		}
+		return "", err
+	}
+
+	return string(policy), nil
+}
+
+// SetAppInfo sets custom application information
+func (s *objStoreServer) SetAppInfo(appName, appVersion string) {
+	// Store app info in the server struct
+	/* s.appInfo = struct {
+		Name    string
+		Version string
+	}{
+		Name:    appName,
+		Version: appVersion,
+	}
+	*/
+}
+
+// TraceOn enables request tracing
+func (s *objStoreServer) TraceOn() {
+	//s.traceEnabled = true
+}
+
+// TraceOff disables request tracing
+func (s *objStoreServer) TraceOff() {
+	//s.traceEnabled = false
 }
