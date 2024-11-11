@@ -1,4 +1,4 @@
-Object Storage with following features:
+Object Backup Server with following features:
 
 	- Supports S3 operations like PUT, GET, DELETE, and HEAD for objects, as well as operations for buckets.
 	- Filesystem Backend: Filesystem-based backend to store the objects, with the root directory at /mnt/objsdata
